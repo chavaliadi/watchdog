@@ -218,16 +218,15 @@ func classifyNetworkError(ctx context.Context, err error) ErrorClass {
 	var certInvalidErr *x509.CertificateInvalidError
 	var unknownAuthErr x509.UnknownAuthorityError
 	var hostnameErr x509.HostnameError
+	var systemRootsErr x509.SystemRootsError
+	var certVerifErr *tls.CertificateVerificationError
 	var recordHeaderErr tls.RecordHeaderError
 	if errors.As(err, &certInvalidErr) ||
 		errors.As(err, &unknownAuthErr) ||
 		errors.As(err, &hostnameErr) ||
+		errors.As(err, &systemRootsErr) ||
+		errors.As(err, &certVerifErr) ||
 		errors.As(err, &recordHeaderErr) {
-		return ErrorClassTLS
-	}
-
-	errStr := strings.ToLower(err.Error())
-	if strings.Contains(errStr, "tls:") || strings.Contains(errStr, "certificate") || strings.Contains(errStr, "handshake failure") {
 		return ErrorClassTLS
 	}
 

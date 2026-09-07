@@ -3,6 +3,7 @@ package checker
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"io"
 	"net"
@@ -373,9 +374,19 @@ func TestHTTPChecker_NetworkErrorClassifications(t *testing.T) {
 			expectedClass: ErrorClassTLS,
 		},
 		{
-			name:          "tls generic handshake error",
-			returnErr:     errors.New("tls: handshake failure"),
+			name:          "tls certificate unknown authority error",
+			returnErr:     x509.UnknownAuthorityError{},
 			expectedClass: ErrorClassTLS,
+		},
+		{
+			name:          "tls certificate invalid error",
+			returnErr:     &x509.CertificateInvalidError{Reason: x509.Expired},
+			expectedClass: ErrorClassTLS,
+		},
+		{
+			name:          "unclassified network error",
+			returnErr:     errors.New("arbitrary network error"),
+			expectedClass: ErrorClassNone,
 		},
 	}
 
