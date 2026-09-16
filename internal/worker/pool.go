@@ -192,6 +192,15 @@ func (p *Pool) SubmitWait(ctx context.Context, job Job) (scheduler.CycleResult, 
 	}
 }
 
+// RunCycle executes a cycle through the worker pool by submitting a Job and waiting for its result.
+// It allows *Pool to directly satisfy scheduler.CycleRunner without an intermediate adapter.
+func (p *Pool) RunCycle(ctx context.Context, m monitor.Monitor, current state.State) (scheduler.CycleResult, error) {
+	return p.SubmitWait(ctx, Job{
+		Monitor:      m,
+		CurrentState: current,
+	})
+}
+
 // Stop initiates graceful shutdown of the worker pool and cancels running jobs.
 func (p *Pool) Stop() {
 	p.stopOnce.Do(func() {

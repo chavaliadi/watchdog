@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -17,13 +18,16 @@ import (
 	"github.com/chavaliadi/watchdog/internal/persistence/postgres"
 	"github.com/chavaliadi/watchdog/internal/retry"
 	"github.com/chavaliadi/watchdog/internal/scheduler"
+	"github.com/chavaliadi/watchdog/internal/worker"
 )
 
 // Config holds runtime configuration for Deployment Watchdog.
 type Config struct {
-	DatabaseURL string
-	MonitorID   string
+	DatabaseURL       string
+	WorkerConcurrency int
 }
+
+const defaultWorkerConcurrency = 5
 
 // loadConfig reads required runtime parameters from environment variables.
 func loadConfig() (Config, error) {
@@ -32,14 +36,16 @@ func loadConfig() (Config, error) {
 		return Config{}, errors.New("missing required environment variable WATCHDOG_DATABASE_URL")
 	}
 
-	monitorID := os.Getenv("WATCHDOG_MONITOR_ID")
-	if monitorID == "" {
-		return Config{}, errors.New("missing required environment variable WATCHDOG_MONITOR_ID")
+	concurrency := defaultWorkerConcurrency
+	if val := os.Getenv("WATCHDOG_WORKER_CONCURRENCY"); val != "" {
+		if parsed, err := strconv.Atoi(val); err == nil && parsed > 0 {
+			concurrency = parsed
+		}
 	}
 
 	return Config{
-		DatabaseURL: dbURL,
-		MonitorID:   monitorID,
+		DatabaseURL:       dbURL,
+		WorkerConcurrency: concurrency,
 	}, nil
 }
 
@@ -81,42 +87,31 @@ func run(ctx context.Context) error {
 	var repo persistence.Repository = postgres.New(db)
 	orch := scheduler.NewOrchestrator(nil, nil, retry.Config{}, repo)
 
-	return execute(ctx, repo, orch, cfg.MonitorID)
+	pool, err := worker.NewPool(worker.Config{
+		MaxConcurrency: cfg.WorkerConcurrency,
+	}, orch)
+	if err != nil {
+		return fmt.Errorf("create worker pool: %w", err)
+	}
+	pool.Start(ctx)
+	defer func() {
+		pool.Stop()
+		pool.Wait()
+	}()
+
+	multiSched, err := scheduler.NewMultiScheduler(repo, pool)
+	if err != nil {
+		return fmt.Errorf("create multi-scheduler: %w", err)
+	}
+
+	log.Printf("deployment-watchdog multi-scheduler running (concurrency=%d)...", cfg.WorkerConcurrency)
+	return execute(ctx, multiSched)
 }
 
-func execute(
-	ctx context.Context,
-	repo persistence.Repository,
-	orch *scheduler.Orchestrator,
-	monitorID string,
-) error {
-	m, err := repo.GetMonitor(ctx, monitorID)
-	if err != nil {
-		return fmt.Errorf("load monitor %q: %w", monitorID, err)
+func execute(ctx context.Context, multiSched *scheduler.MultiScheduler) error {
+	if err := multiSched.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		return fmt.Errorf("multi-scheduler run: %w", err)
 	}
-	log.Printf("monitor loaded: id=%s name=%s kind=%s target=%s", m.ID, m.Name, m.Kind, m.TargetURL)
-
-	currentState, err := repo.GetState(ctx, monitorID)
-	if err != nil {
-		return fmt.Errorf("load state for monitor %q: %w", monitorID, err)
-	}
-	log.Printf("current state loaded: %s", currentState)
-
-	res, err := orch.RunCycle(ctx, m, currentState)
-	if err != nil {
-		return fmt.Errorf("run cycle for monitor %q: %w", monitorID, err)
-	}
-
-	log.Printf(
-		"cycle executed: ok=%v status_code=%d latency=%v attempts=%d current_state=%s next_state=%s transitioned=%v",
-		res.CheckResult.OK,
-		res.CheckResult.StatusCode,
-		res.CheckResult.Latency,
-		res.CheckResult.AttemptCount,
-		res.TransitionResult.CurrentState,
-		res.TransitionResult.NextState,
-		res.TransitionResult.Transitioned,
-	)
 
 	log.Println("deployment-watchdog completed successfully")
 	return nil
