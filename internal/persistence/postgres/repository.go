@@ -28,15 +28,16 @@ func New(db *sql.DB) *Repository {
 	return &Repository{db: db}
 }
 
-// GetMonitor retrieves an individual monitor configuration by ID from the monitors table.
-// If the monitor row does not exist, sql.ErrNoRows is wrapped and returned.
-func (r *Repository) GetMonitor(ctx context.Context, id string) (monitor.Monitor, error) {
-	const query = `
-		SELECT id, name, kind, target, method, expected_status_range, created_at, updated_at
-		FROM monitors
-		WHERE id = $1
-	`
+const selectMonitorColumns = `
+	id, name, kind, target, method, expected_status_range,
+	interval_ms, timeout_ms, enabled, created_at, updated_at
+`
 
+type scanner interface {
+	Scan(dest ...any) error
+}
+
+func scanMonitor(s scanner) (monitor.Monitor, error) {
 	var (
 		mID                 string
 		name                string
@@ -44,25 +45,28 @@ func (r *Repository) GetMonitor(ctx context.Context, id string) (monitor.Monitor
 		target              string
 		method              sql.NullString
 		expectedStatusRange sql.NullString
+		intervalMs          int64
+		timeoutMs           int64
+		enabled             bool
 		createdAt           time.Time
 		updatedAt           time.Time
 	)
 
-	err := r.db.QueryRowContext(ctx, query, id).Scan(
+	err := s.Scan(
 		&mID,
 		&name,
 		&kindStr,
 		&target,
 		&method,
 		&expectedStatusRange,
+		&intervalMs,
+		&timeoutMs,
+		&enabled,
 		&createdAt,
 		&updatedAt,
 	)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return monitor.Monitor{}, fmt.Errorf("get monitor %q: %w", id, sql.ErrNoRows)
-		}
-		return monitor.Monitor{}, fmt.Errorf("get monitor %q: %w", id, err)
+		return monitor.Monitor{}, err
 	}
 
 	m := monitor.Monitor{
@@ -70,6 +74,9 @@ func (r *Repository) GetMonitor(ctx context.Context, id string) (monitor.Monitor
 		Name:      name,
 		Kind:      monitor.Kind(kindStr),
 		TargetURL: target,
+		Interval:  time.Duration(intervalMs) * time.Millisecond,
+		Timeout:   time.Duration(timeoutMs) * time.Millisecond,
+		Enabled:   enabled,
 		CreatedAt: createdAt,
 	}
 
@@ -81,6 +88,56 @@ func (r *Repository) GetMonitor(ctx context.Context, id string) (monitor.Monitor
 	}
 
 	return m, nil
+}
+
+// GetMonitor retrieves an individual monitor configuration by ID from the monitors table.
+// If the monitor row does not exist, sql.ErrNoRows is wrapped and returned.
+func (r *Repository) GetMonitor(ctx context.Context, id string) (monitor.Monitor, error) {
+	query := `
+		SELECT ` + selectMonitorColumns + `
+		FROM monitors
+		WHERE id = $1
+	`
+
+	m, err := scanMonitor(r.db.QueryRowContext(ctx, query, id))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return monitor.Monitor{}, fmt.Errorf("get monitor %q: %w", id, sql.ErrNoRows)
+		}
+		return monitor.Monitor{}, fmt.Errorf("get monitor %q: %w", id, err)
+	}
+
+	return m, nil
+}
+
+// ListMonitors retrieves all monitor configurations ordered deterministically by creation time and ID.
+// It returns an empty slice if no monitors exist.
+func (r *Repository) ListMonitors(ctx context.Context) ([]monitor.Monitor, error) {
+	query := `
+		SELECT ` + selectMonitorColumns + `
+		FROM monitors
+		ORDER BY created_at ASC, id ASC
+	`
+
+	rows, err := r.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("list monitors: %w", err)
+	}
+	defer rows.Close()
+
+	monitors := make([]monitor.Monitor, 0)
+	for rows.Next() {
+		m, err := scanMonitor(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan monitor in list: %w", err)
+		}
+		monitors = append(monitors, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list monitors rows iteration: %w", err)
+	}
+
+	return monitors, nil
 }
 
 // GetState retrieves the current health state of a monitor from monitor_states.
@@ -138,6 +195,16 @@ func (r *Repository) CreateMonitor(ctx context.Context, m monitor.Monitor) error
 	}
 	updatedAt := now
 
+	intervalMs := m.Interval.Milliseconds()
+	if intervalMs <= 0 {
+		intervalMs = 60000
+	}
+
+	timeoutMs := m.Timeout.Milliseconds()
+	if timeoutMs <= 0 {
+		timeoutMs = 5000
+	}
+
 	const insertMonitorQuery = `
 		INSERT INTO monitors (
 			id,
@@ -146,9 +213,12 @@ func (r *Repository) CreateMonitor(ctx context.Context, m monitor.Monitor) error
 			target,
 			method,
 			expected_status_range,
+			interval_ms,
+			timeout_ms,
+			enabled,
 			created_at,
 			updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 	`
 	_, err = tx.ExecContext(
 		ctx,
@@ -159,6 +229,9 @@ func (r *Repository) CreateMonitor(ctx context.Context, m monitor.Monitor) error
 		m.TargetURL,
 		method,
 		expectedStatusRange,
+		intervalMs,
+		timeoutMs,
+		m.Enabled,
 		createdAt,
 		updatedAt,
 	)

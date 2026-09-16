@@ -30,6 +30,10 @@ func (m *mockAppRepo) GetMonitor(ctx context.Context, id string) (monitor.Monito
 	return monitor.Monitor{ID: id, Kind: monitor.KindHTTP, TargetURL: "http://example.com"}, nil
 }
 
+func (m *mockAppRepo) ListMonitors(ctx context.Context) ([]monitor.Monitor, error) {
+	return nil, nil
+}
+
 func (m *mockAppRepo) GetState(ctx context.Context, monitorID string) (state.State, error) {
 	if m.getStateFn != nil {
 		return m.getStateFn(ctx, monitorID)

@@ -12,6 +12,7 @@ import (
 // monitor health states, and cycle check results.
 type Repository interface {
 	GetMonitor(ctx context.Context, id string) (monitor.Monitor, error)
+	ListMonitors(ctx context.Context) ([]monitor.Monitor, error)
 	GetState(ctx context.Context, monitorID string) (state.State, error)
 	CreateMonitor(ctx context.Context, m monitor.Monitor) error
 	SaveCycle(

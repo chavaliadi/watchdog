@@ -71,6 +71,10 @@ func (f *fakeRepository) GetMonitor(ctx context.Context, id string) (monitor.Mon
 	return monitor.Monitor{ID: id}, nil
 }
 
+func (f *fakeRepository) ListMonitors(ctx context.Context) ([]monitor.Monitor, error) {
+	return nil, nil
+}
+
 func (f *fakeRepository) GetState(ctx context.Context, monitorID string) (state.State, error) {
 	f.getStateCalls++
 	return state.StateUnknown, nil

@@ -53,21 +53,27 @@ func TestMain(m *testing.M) {
 		log.Fatalf("failed to ping test database: %v", err)
 	}
 
-	// Apply schema migration
-	schemaPath := filepath.Join("..", "..", "..", "migrations", "001_initial_schema.up.sql")
-	schemaSQL, err := os.ReadFile(schemaPath)
-	if err != nil {
-		if cleanup != nil {
-			cleanup()
-		}
-		log.Fatalf("failed to read schema file %q: %v", schemaPath, err)
+	// Apply schema migrations (001 and 002)
+	migrationFiles := []string{
+		"001_initial_schema.up.sql",
+		"002_monitor_scheduling_fields.up.sql",
 	}
-
-	if _, err := testDB.Exec(string(schemaSQL)); err != nil {
-		if cleanup != nil {
-			cleanup()
+	for _, migrationFile := range migrationFiles {
+		schemaPath := filepath.Join("..", "..", "..", "migrations", migrationFile)
+		schemaSQL, err := os.ReadFile(schemaPath)
+		if err != nil {
+			if cleanup != nil {
+				cleanup()
+			}
+			log.Fatalf("failed to read schema file %q: %v", schemaPath, err)
 		}
-		log.Fatalf("failed to execute initial schema: %v", err)
+
+		if _, err := testDB.Exec(string(schemaSQL)); err != nil {
+			if cleanup != nil {
+				cleanup()
+			}
+			log.Fatalf("failed to execute migration %q: %v", migrationFile, err)
+		}
 	}
 
 	code := m.Run()
@@ -225,6 +231,196 @@ func TestGetMonitor(t *testing.T) {
 		}
 		if got.ExpectedStatusRange != "" {
 			t.Errorf("expected empty ExpectedStatusRange for TCP monitor, got %q", got.ExpectedStatusRange)
+		}
+	})
+
+	t.Run("Interval, Timeout, and Enabled round-trip correctly", func(t *testing.T) {
+		cleanTables(t)
+
+		id := "12345678-1234-1234-1234-123456789012"
+		m := monitor.Monitor{
+			ID:                  id,
+			Name:                "Custom Timing",
+			Kind:                monitor.KindHTTP,
+			TargetURL:           "https://example.com/timing",
+			Method:              "GET",
+			ExpectedStatusRange: "200-299",
+			Interval:            15 * time.Second,
+			Timeout:             3500 * time.Millisecond,
+			Enabled:             true,
+		}
+		if err := repo.CreateMonitor(ctx, m); err != nil {
+			t.Fatalf("CreateMonitor failed: %v", err)
+		}
+
+		got, err := repo.GetMonitor(ctx, id)
+		if err != nil {
+			t.Fatalf("GetMonitor failed: %v", err)
+		}
+
+		if got.Interval != 15*time.Second {
+			t.Errorf("Interval mismatch: got %v, want %v", got.Interval, 15*time.Second)
+		}
+		if got.Timeout != 3500*time.Millisecond {
+			t.Errorf("Timeout mismatch: got %v, want %v", got.Timeout, 3500*time.Millisecond)
+		}
+		if got.Enabled != true {
+			t.Errorf("Enabled mismatch: got %v, want true", got.Enabled)
+		}
+
+		// Also verify disabled monitor round-trips
+		idDisabled := "87654321-4321-4321-4321-210987654321"
+		mDisabled := monitor.Monitor{
+			ID:        idDisabled,
+			Name:      "Disabled Timing",
+			Kind:      monitor.KindHTTP,
+			TargetURL: "https://example.com/disabled",
+			Interval:  45 * time.Second,
+			Timeout:   2 * time.Second,
+			Enabled:   false,
+		}
+		if err := repo.CreateMonitor(ctx, mDisabled); err != nil {
+			t.Fatalf("CreateMonitor disabled failed: %v", err)
+		}
+
+		gotDisabled, err := repo.GetMonitor(ctx, idDisabled)
+		if err != nil {
+			t.Fatalf("GetMonitor disabled failed: %v", err)
+		}
+		if gotDisabled.Enabled != false {
+			t.Errorf("Enabled mismatch: got %v, want false", gotDisabled.Enabled)
+		}
+		if gotDisabled.Interval != 45*time.Second {
+			t.Errorf("Interval mismatch: got %v, want %v", gotDisabled.Interval, 45*time.Second)
+		}
+	})
+}
+
+func TestListMonitors(t *testing.T) {
+	repo := postgres.New(testDB)
+	ctx := context.Background()
+
+	t.Run("Empty table returns empty slice and nil error", func(t *testing.T) {
+		cleanTables(t)
+
+		list, err := repo.ListMonitors(ctx)
+		if err != nil {
+			t.Fatalf("ListMonitors failed: %v", err)
+		}
+		if list == nil {
+			t.Fatal("expected non-nil empty slice, got nil")
+		}
+		if len(list) != 0 {
+			t.Errorf("expected 0 monitors, got %d", len(list))
+		}
+	})
+
+	t.Run("Multiple monitors returned with deterministic ordering and full field hydration", func(t *testing.T) {
+		cleanTables(t)
+
+		t1 := time.Date(2026, 9, 16, 10, 0, 0, 0, time.UTC)
+		t2 := time.Date(2026, 9, 16, 10, 1, 0, 0, time.UTC)
+		t3 := time.Date(2026, 9, 16, 10, 2, 0, 0, time.UTC)
+
+		m1 := monitor.Monitor{
+			ID:                  "11111111-1111-1111-1111-111111111111",
+			Name:                "Alpha Monitor",
+			Kind:                monitor.KindHTTP,
+			TargetURL:           "https://alpha.example.com",
+			Method:              "GET",
+			ExpectedStatusRange: "200-299",
+			Interval:            30 * time.Second,
+			Timeout:             4 * time.Second,
+			Enabled:             true,
+			CreatedAt:           t1,
+		}
+		m2 := monitor.Monitor{
+			ID:        "22222222-2222-2222-2222-222222222222",
+			Name:      "Beta Monitor",
+			Kind:      monitor.KindTCP,
+			TargetURL: "127.0.0.1:5432",
+			Interval:  10 * time.Second,
+			Timeout:   1 * time.Second,
+			Enabled:   false,
+			CreatedAt: t2,
+		}
+		m3 := monitor.Monitor{
+			ID:                  "33333333-3333-3333-3333-333333333333",
+			Name:                "Gamma Monitor",
+			Kind:                monitor.KindHTTP,
+			TargetURL:           "https://gamma.example.com/api",
+			Method:              "POST",
+			ExpectedStatusRange: "201",
+			Interval:            60 * time.Second,
+			Timeout:             5 * time.Second,
+			Enabled:             true,
+			CreatedAt:           t3,
+		}
+
+		// Insert out of order (m2, m3, m1)
+		for _, m := range []monitor.Monitor{m2, m3, m1} {
+			if err := repo.CreateMonitor(ctx, m); err != nil {
+				t.Fatalf("CreateMonitor %s failed: %v", m.ID, err)
+			}
+		}
+
+		list, err := repo.ListMonitors(ctx)
+		if err != nil {
+			t.Fatalf("ListMonitors failed: %v", err)
+		}
+
+		if len(list) != 3 {
+			t.Fatalf("expected 3 monitors, got %d", len(list))
+		}
+
+		// Verify deterministic ordering by created_at ASC (m1, m2, m3)
+		expectedIDs := []string{m1.ID, m2.ID, m3.ID}
+		for i, expectedID := range expectedIDs {
+			if list[i].ID != expectedID {
+				t.Errorf("index %d ID mismatch: got %q, want %q", i, list[i].ID, expectedID)
+			}
+		}
+
+		// Verify full hydration of m1
+		got1 := list[0]
+		if got1.Name != m1.Name || got1.Kind != m1.Kind || got1.TargetURL != m1.TargetURL ||
+			got1.Method != m1.Method || got1.ExpectedStatusRange != m1.ExpectedStatusRange ||
+			got1.Interval != m1.Interval || got1.Timeout != m1.Timeout || got1.Enabled != m1.Enabled {
+			t.Errorf("m1 hydration mismatch: got %+v, want %+v", got1, m1)
+		}
+
+		// Verify full hydration of m2 (TCP monitor with empty Method/ExpectedStatusRange and Enabled=false)
+		got2 := list[1]
+		if got2.Name != m2.Name || got2.Kind != m2.Kind || got2.TargetURL != m2.TargetURL ||
+			got2.Method != "" || got2.ExpectedStatusRange != "" ||
+			got2.Interval != m2.Interval || got2.Timeout != m2.Timeout || got2.Enabled != false {
+			t.Errorf("m2 hydration mismatch: got %+v, want %+v", got2, m2)
+		}
+	})
+
+	t.Run("Context cancellation returns error", func(t *testing.T) {
+		cleanTables(t)
+
+		cancCtx, cancel := context.WithCancel(ctx)
+		cancel()
+
+		_, err := repo.ListMonitors(cancCtx)
+		if err == nil {
+			t.Fatal("expected error with canceled context, got nil")
+		}
+	})
+
+	t.Run("Database error returns wrapped error", func(t *testing.T) {
+		badDB, err := sql.Open("pgx", "postgres://invalid:invalid@127.0.0.1:1/invalid?sslmode=disable")
+		if err != nil {
+			t.Fatalf("open bad db failed: %v", err)
+		}
+		_ = badDB.Close()
+
+		badRepo := postgres.New(badDB)
+		_, err = badRepo.ListMonitors(ctx)
+		if err == nil {
+			t.Fatal("expected error on closed db, got nil")
 		}
 	})
 }
