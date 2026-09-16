@@ -6,18 +6,22 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/chavaliadi/watchdog/internal/api"
 	"github.com/chavaliadi/watchdog/internal/persistence"
 	"github.com/chavaliadi/watchdog/internal/persistence/postgres"
 	"github.com/chavaliadi/watchdog/internal/retry"
 	"github.com/chavaliadi/watchdog/internal/scheduler"
+	"github.com/chavaliadi/watchdog/internal/service"
 	"github.com/chavaliadi/watchdog/internal/worker"
 )
 
@@ -25,9 +29,13 @@ import (
 type Config struct {
 	DatabaseURL       string
 	WorkerConcurrency int
+	HTTPPort          string
 }
 
-const defaultWorkerConcurrency = 5
+const (
+	defaultWorkerConcurrency = 5
+	defaultHTTPPort          = ":8080"
+)
 
 // loadConfig reads required runtime parameters from environment variables.
 func loadConfig() (Config, error) {
@@ -43,9 +51,17 @@ func loadConfig() (Config, error) {
 		}
 	}
 
+	httpPort := os.Getenv("WATCHDOG_HTTP_PORT")
+	if httpPort == "" {
+		httpPort = defaultHTTPPort
+	} else if !strings.HasPrefix(httpPort, ":") {
+		httpPort = ":" + httpPort
+	}
+
 	return Config{
 		DatabaseURL:       dbURL,
 		WorkerConcurrency: concurrency,
+		HTTPPort:          httpPort,
 	}, nil
 }
 
@@ -104,13 +120,51 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("create multi-scheduler: %w", err)
 	}
 
-	log.Printf("deployment-watchdog multi-scheduler running (concurrency=%d)...", cfg.WorkerConcurrency)
-	return execute(ctx, multiSched)
+	monitorSvc := service.NewMonitorService(repo, multiSched)
+	handlers := api.NewHandlers(monitorSvc)
+	apiServer := api.NewServer(api.Config{Addr: cfg.HTTPPort}, handlers)
+
+	log.Printf("deployment-watchdog running (concurrency=%d, http_port=%s)...", cfg.WorkerConcurrency, cfg.HTTPPort)
+	return execute(ctx, multiSched, apiServer)
 }
 
-func execute(ctx context.Context, multiSched *scheduler.MultiScheduler) error {
-	if err := multiSched.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		return fmt.Errorf("multi-scheduler run: %w", err)
+func execute(ctx context.Context, multiSched *scheduler.MultiScheduler, apiServer *api.Server) error {
+	if err := multiSched.Start(ctx); err != nil {
+		return fmt.Errorf("multi-scheduler start: %w", err)
+	}
+
+	serverErr := make(chan error, 1)
+	go func() {
+		if err := apiServer.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+		}
+		close(serverErr)
+	}()
+
+	var runErr error
+	select {
+	case <-ctx.Done():
+		log.Println("shutdown signal received, initiating graceful shutdown...")
+	case err := <-serverErr:
+		if err != nil {
+			runErr = fmt.Errorf("http server error: %w", err)
+			log.Printf("http server error: %v, initiating shutdown...", err)
+		}
+	}
+
+	// 1. Gracefully shut down HTTP server with bounded timeout
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := apiServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("error during http server shutdown: %v", err)
+	}
+
+	// 2. Stop MultiScheduler runners and wait
+	multiSched.Stop()
+	multiSched.Wait()
+
+	if runErr != nil {
+		return runErr
 	}
 
 	log.Println("deployment-watchdog completed successfully")

@@ -985,3 +985,334 @@ func TestConcurrentRepositoryUsage(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestUpdateMonitor(t *testing.T) {
+	cleanTables(t)
+	repo := postgres.New(testDB)
+	ctx := context.Background()
+
+	mID := "11111111-2222-3333-4444-555555555555"
+	m := monitor.Monitor{
+		ID:                  mID,
+		Name:                "Original Name",
+		Kind:                monitor.KindHTTP,
+		TargetURL:           "https://original.example.com",
+		Method:              "GET",
+		ExpectedStatusRange: "200",
+		Interval:            30 * time.Second,
+		Timeout:             5 * time.Second,
+		Enabled:             true,
+	}
+
+	if err := repo.CreateMonitor(ctx, m); err != nil {
+		t.Fatalf("CreateMonitor failed: %v", err)
+	}
+
+	t.Run("successful update", func(t *testing.T) {
+		updated := monitor.Monitor{
+			ID:                  mID,
+			Name:                "Updated Name",
+			Kind:                monitor.KindHTTP,
+			TargetURL:           "https://updated.example.com",
+			Method:              "POST",
+			ExpectedStatusRange: "200-204",
+			Interval:            10 * time.Second,
+			Timeout:             2 * time.Second,
+			Enabled:             false,
+		}
+
+		if err := repo.UpdateMonitor(ctx, updated); err != nil {
+			t.Fatalf("UpdateMonitor failed: %v", err)
+		}
+
+		got, err := repo.GetMonitor(ctx, mID)
+		if err != nil {
+			t.Fatalf("GetMonitor failed: %v", err)
+		}
+
+		if got.Name != "Updated Name" {
+			t.Errorf("expected Name %q, got %q", "Updated Name", got.Name)
+		}
+		if got.TargetURL != "https://updated.example.com" {
+			t.Errorf("expected TargetURL %q, got %q", "https://updated.example.com", got.TargetURL)
+		}
+		if got.Method != "POST" {
+			t.Errorf("expected Method %q, got %q", "POST", got.Method)
+		}
+		if got.ExpectedStatusRange != "200-204" {
+			t.Errorf("expected ExpectedStatusRange %q, got %q", "200-204", got.ExpectedStatusRange)
+		}
+		if got.Interval != 10*time.Second {
+			t.Errorf("expected Interval %v, got %v", 10*time.Second, got.Interval)
+		}
+		if got.Timeout != 2*time.Second {
+			t.Errorf("expected Timeout %v, got %v", 2*time.Second, got.Timeout)
+		}
+		if got.Enabled != false {
+			t.Errorf("expected Enabled false, got true")
+		}
+	})
+
+	t.Run("missing monitor returns ErrNoRows", func(t *testing.T) {
+		missing := monitor.Monitor{
+			ID:        "00000000-0000-0000-0000-000000000000",
+			Name:      "Missing",
+			TargetURL: "https://missing.example.com",
+		}
+		err := repo.UpdateMonitor(ctx, missing)
+		if err == nil {
+			t.Fatal("expected error updating missing monitor, got nil")
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("expected errors.Is(err, sql.ErrNoRows), got: %v", err)
+		}
+	})
+
+	t.Run("canceled context", func(t *testing.T) {
+		canceledCtx, cancel := context.WithCancel(ctx)
+		cancel()
+
+		err := repo.UpdateMonitor(canceledCtx, m)
+		if err == nil {
+			t.Fatal("expected error with canceled context, got nil")
+		}
+	})
+}
+
+func TestDeleteMonitor(t *testing.T) {
+	cleanTables(t)
+	repo := postgres.New(testDB)
+	ctx := context.Background()
+
+	mID := "22222222-3333-4444-5555-666666666666"
+	m := monitor.Monitor{
+		ID:        mID,
+		Name:      "To Be Deleted",
+		Kind:      monitor.KindHTTP,
+		TargetURL: "https://delete.example.com",
+		Interval:  10 * time.Second,
+		Timeout:   2 * time.Second,
+		Enabled:   true,
+	}
+
+	if err := repo.CreateMonitor(ctx, m); err != nil {
+		t.Fatalf("CreateMonitor failed: %v", err)
+	}
+
+	// Add a check result to test cascade delete
+	cycleRes := checker.CheckResult{
+		MonitorID:    mID,
+		OK:           true,
+		StatusCode:   200,
+		Latency:      100 * time.Millisecond,
+		AttemptCount: 1,
+		CheckedAt:    time.Now().UTC(),
+	}
+	if err := repo.SaveCycle(ctx, mID, cycleRes, state.StateHealthy); err != nil {
+		t.Fatalf("SaveCycle failed: %v", err)
+	}
+
+	t.Run("successful delete with cascade", func(t *testing.T) {
+		if err := repo.DeleteMonitor(ctx, mID); err != nil {
+			t.Fatalf("DeleteMonitor failed: %v", err)
+		}
+
+		// Verify monitor is gone
+		_, err := repo.GetMonitor(ctx, mID)
+		if !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("expected ErrNoRows getting deleted monitor, got %v", err)
+		}
+
+		// Verify monitor state is cascade deleted
+		_, err = repo.GetState(ctx, mID)
+		if !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("expected ErrNoRows getting deleted monitor state, got %v", err)
+		}
+
+		// Verify check results are cascade deleted
+		history, err := repo.ListCheckResults(ctx, mID, 10)
+		if err != nil {
+			t.Fatalf("ListCheckResults failed: %v", err)
+		}
+		if len(history) != 0 {
+			t.Fatalf("expected 0 check results after cascade delete, got %d", len(history))
+		}
+	})
+
+	t.Run("delete missing monitor returns ErrNoRows", func(t *testing.T) {
+		err := repo.DeleteMonitor(ctx, "00000000-0000-0000-0000-000000000000")
+		if err == nil {
+			t.Fatal("expected error deleting missing monitor, got nil")
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("expected errors.Is(err, sql.ErrNoRows), got: %v", err)
+		}
+	})
+
+	t.Run("canceled context", func(t *testing.T) {
+		canceledCtx, cancel := context.WithCancel(ctx)
+		cancel()
+
+		err := repo.DeleteMonitor(canceledCtx, mID)
+		if err == nil {
+			t.Fatal("expected error with canceled context, got nil")
+		}
+	})
+}
+
+func TestListCheckResults(t *testing.T) {
+	cleanTables(t)
+	repo := postgres.New(testDB)
+	ctx := context.Background()
+
+	mID := "33333333-4444-5555-6666-777777777777"
+	m := monitor.Monitor{
+		ID:        mID,
+		Name:      "History Test",
+		Kind:      monitor.KindHTTP,
+		TargetURL: "https://history.example.com",
+		Interval:  10 * time.Second,
+		Timeout:   2 * time.Second,
+		Enabled:   true,
+	}
+
+	if err := repo.CreateMonitor(ctx, m); err != nil {
+		t.Fatalf("CreateMonitor failed: %v", err)
+	}
+
+	t.Run("empty history returns empty slice", func(t *testing.T) {
+		results, err := repo.ListCheckResults(ctx, mID, 10)
+		if err != nil {
+			t.Fatalf("ListCheckResults failed: %v", err)
+		}
+		if results == nil {
+			t.Fatal("expected non-nil empty slice")
+		}
+		if len(results) != 0 {
+			t.Fatalf("expected 0 check results, got %d", len(results))
+		}
+	})
+
+	t.Run("history ordering and fields", func(t *testing.T) {
+		baseTime := time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC)
+		// Save 5 cycles with increasing timestamps
+		for i := 1; i <= 5; i++ {
+			res := checker.CheckResult{
+				MonitorID:    mID,
+				OK:           i%2 == 1,
+				StatusCode:   200 + i,
+				Latency:      time.Duration(i*10) * time.Millisecond,
+				AttemptCount: i,
+				CheckedAt:    baseTime.Add(time.Duration(i) * time.Minute),
+			}
+			st := state.StateHealthy
+			if !res.OK {
+				st = state.StateUnhealthy
+				res.ErrorClass = checker.ErrorClassStatus
+				res.ErrorDetail = fmt.Sprintf("status code %d", res.StatusCode)
+			}
+			if err := repo.SaveCycle(ctx, mID, res, st); err != nil {
+				t.Fatalf("SaveCycle %d failed: %v", i, err)
+			}
+		}
+
+		// Retrieve with limit 3 -> should get cycles 5, 4, 3 (most recent first)
+		results, err := repo.ListCheckResults(ctx, mID, 3)
+		if err != nil {
+			t.Fatalf("ListCheckResults failed: %v", err)
+		}
+		if len(results) != 3 {
+			t.Fatalf("expected 3 results, got %d", len(results))
+		}
+
+		if results[0].StatusCode != 205 {
+			t.Errorf("expected first result to be cycle 5 (code 205), got %d", results[0].StatusCode)
+		}
+		if results[1].StatusCode != 204 {
+			t.Errorf("expected second result to be cycle 4 (code 204), got %d", results[1].StatusCode)
+		}
+		if results[2].StatusCode != 203 {
+			t.Errorf("expected third result to be cycle 3 (code 203), got %d", results[2].StatusCode)
+		}
+		if results[1].ErrorClass != checker.ErrorClassStatus {
+			t.Errorf("expected error class status, got %q", results[1].ErrorClass)
+		}
+		if results[1].ErrorDetail != "status code 204" {
+			t.Errorf("expected error detail 'status code 204', got %q", results[1].ErrorDetail)
+		}
+	})
+
+	t.Run("canceled context", func(t *testing.T) {
+		canceledCtx, cancel := context.WithCancel(ctx)
+		cancel()
+
+		_, err := repo.ListCheckResults(canceledCtx, mID, 10)
+		if err == nil {
+			t.Fatal("expected error with canceled context, got nil")
+		}
+	})
+}
+
+func TestGetStateWithTimestamp(t *testing.T) {
+	cleanTables(t)
+	repo := postgres.New(testDB)
+	ctx := context.Background()
+
+	mID := "44444444-5555-6666-7777-888888888888"
+	m := monitor.Monitor{
+		ID:        mID,
+		Name:      "Timestamp Test",
+		Kind:      monitor.KindHTTP,
+		TargetURL: "https://timestamp.example.com",
+		Interval:  10 * time.Second,
+		Timeout:   2 * time.Second,
+		Enabled:   true,
+	}
+
+	if err := repo.CreateMonitor(ctx, m); err != nil {
+		t.Fatalf("CreateMonitor failed: %v", err)
+	}
+
+	st, ts, err := repo.GetStateWithTimestamp(ctx, mID)
+	if err != nil {
+		t.Fatalf("GetStateWithTimestamp failed: %v", err)
+	}
+	if st != state.StateUnknown {
+		t.Errorf("expected initial state UNKNOWN, got %q", st)
+	}
+	if ts.IsZero() {
+		t.Error("expected non-zero initial updated_at timestamp")
+	}
+
+	// Update via SaveCycle
+	checkedAt := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
+	cycleRes := checker.CheckResult{
+		MonitorID:    mID,
+		OK:           true,
+		StatusCode:   200,
+		Latency:      50 * time.Millisecond,
+		AttemptCount: 1,
+		CheckedAt:    checkedAt,
+	}
+	if err := repo.SaveCycle(ctx, mID, cycleRes, state.StateHealthy); err != nil {
+		t.Fatalf("SaveCycle failed: %v", err)
+	}
+
+	st, ts, err = repo.GetStateWithTimestamp(ctx, mID)
+	if err != nil {
+		t.Fatalf("GetStateWithTimestamp after cycle failed: %v", err)
+	}
+	if st != state.StateHealthy {
+		t.Errorf("expected state HEALTHY, got %q", st)
+	}
+	if ts.Sub(checkedAt).Abs() > time.Second {
+		t.Errorf("expected updated_at close to %v, got %v", checkedAt, ts)
+	}
+
+	// Missing monitor
+	_, _, err = repo.GetStateWithTimestamp(ctx, "00000000-0000-0000-0000-000000000000")
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected ErrNoRows for missing monitor, got %v", err)
+	}
+}
+

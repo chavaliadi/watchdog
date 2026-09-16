@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/chavaliadi/watchdog/internal/checker"
@@ -78,6 +79,7 @@ func scanMonitor(s scanner) (monitor.Monitor, error) {
 		Timeout:   time.Duration(timeoutMs) * time.Millisecond,
 		Enabled:   enabled,
 		CreatedAt: createdAt,
+		UpdatedAt: updatedAt,
 	}
 
 	if method.Valid {
@@ -140,32 +142,41 @@ func (r *Repository) ListMonitors(ctx context.Context) ([]monitor.Monitor, error
 	return monitors, nil
 }
 
-// GetState retrieves the current health state of a monitor from monitor_states.
+// GetStateWithTimestamp retrieves the current health state and last update time of a monitor from monitor_states.
 // If no state row exists, sql.ErrNoRows is wrapped and returned.
 // If the database contains an invalid/unrecognized state string, an error is returned.
-func (r *Repository) GetState(ctx context.Context, monitorID string) (state.State, error) {
+func (r *Repository) GetStateWithTimestamp(ctx context.Context, monitorID string) (state.State, time.Time, error) {
 	const query = `
-		SELECT state
+		SELECT state, updated_at
 		FROM monitor_states
 		WHERE monitor_id = $1
 	`
 
-	var rawState string
-	err := r.db.QueryRowContext(ctx, query, monitorID).Scan(&rawState)
+	var (
+		rawState  string
+		updatedAt time.Time
+	)
+	err := r.db.QueryRowContext(ctx, query, monitorID).Scan(&rawState, &updatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return "", fmt.Errorf("get state for monitor %q: %w", monitorID, sql.ErrNoRows)
+			return "", time.Time{}, fmt.Errorf("get state for monitor %q: %w", monitorID, sql.ErrNoRows)
 		}
-		return "", fmt.Errorf("get state for monitor %q: %w", monitorID, err)
+		return "", time.Time{}, fmt.Errorf("get state for monitor %q: %w", monitorID, err)
 	}
 
 	st := state.State(rawState)
 	switch st {
 	case state.StateUnknown, state.StateHealthy, state.StateUnhealthy:
-		return st, nil
+		return st, updatedAt, nil
 	default:
-		return "", fmt.Errorf("invalid persisted state %q for monitor %q", rawState, monitorID)
+		return "", time.Time{}, fmt.Errorf("invalid persisted state %q for monitor %q", rawState, monitorID)
 	}
+}
+
+// GetState retrieves the current health state of a monitor from monitor_states.
+func (r *Repository) GetState(ctx context.Context, monitorID string) (state.State, error) {
+	st, _, err := r.GetStateWithTimestamp(ctx, monitorID)
+	return st, err
 }
 
 // CreateMonitor creates a new monitor and its initial UNKNOWN health state atomically.
@@ -371,3 +382,177 @@ func (r *Repository) SaveCycle(
 
 	return nil
 }
+
+// UpdateMonitor updates an existing monitor's configuration.
+// If the monitor does not exist, sql.ErrNoRows is wrapped and returned.
+func (r *Repository) UpdateMonitor(ctx context.Context, m monitor.Monitor) error {
+	var method sql.NullString
+	if m.Method != "" {
+		method = sql.NullString{String: m.Method, Valid: true}
+	}
+
+	var expectedStatusRange sql.NullString
+	if m.ExpectedStatusRange != "" {
+		expectedStatusRange = sql.NullString{String: m.ExpectedStatusRange, Valid: true}
+	}
+
+	intervalMs := m.Interval.Milliseconds()
+	if intervalMs <= 0 {
+		intervalMs = 60000
+	}
+
+	timeoutMs := m.Timeout.Milliseconds()
+	if timeoutMs <= 0 {
+		timeoutMs = 5000
+	}
+
+	now := time.Now().UTC()
+
+	const updateQuery = `
+		UPDATE monitors
+		SET
+			name = $1,
+			target = $2,
+			method = $3,
+			expected_status_range = $4,
+			interval_ms = $5,
+			timeout_ms = $6,
+			enabled = $7,
+			updated_at = $8
+		WHERE id = $9
+	`
+
+	res, err := r.db.ExecContext(
+		ctx,
+		updateQuery,
+		m.Name,
+		m.TargetURL,
+		method,
+		expectedStatusRange,
+		intervalMs,
+		timeoutMs,
+		m.Enabled,
+		now,
+		m.ID,
+	)
+	if err != nil {
+		return fmt.Errorf("update monitor %q: %w", m.ID, err)
+	}
+
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check rows affected for update monitor %q: %w", m.ID, err)
+	}
+	if rowsAffected == 0 {
+		return fmt.Errorf("update monitor %q: %w", m.ID, sql.ErrNoRows)
+	}
+
+	return nil
+}
+
+// DeleteMonitor deletes an existing monitor by ID.
+// Cascade rules in PostgreSQL automatically clean up associated monitor_states and check_results.
+// If the monitor does not exist, sql.ErrNoRows is wrapped and returned.
+func (r *Repository) DeleteMonitor(ctx context.Context, id string) error {
+	const deleteQuery = `
+		DELETE FROM monitors
+		WHERE id = $1
+	`
+
+	res, err := r.db.ExecContext(ctx, deleteQuery, id)
+	if err != nil {
+		return fmt.Errorf("delete monitor %q: %w", id, err)
+	}
+
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check rows affected for delete monitor %q: %w", id, err)
+	}
+	if rowsAffected == 0 {
+		return fmt.Errorf("delete monitor %q: %w", id, sql.ErrNoRows)
+	}
+
+	return nil
+}
+
+// ListCheckResults returns recent check results for a given monitor ordered by checked_at DESC, id DESC.
+// If no check results exist, an empty slice is returned.
+func (r *Repository) ListCheckResults(ctx context.Context, monitorID string, limit int) ([]checker.CheckResult, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+
+	const query = `
+		SELECT id, monitor_id, ok, status_code, latency_ms, error_class, error_detail, attempt_count, checked_at
+		FROM check_results
+		WHERE monitor_id = $1
+		ORDER BY checked_at DESC, id DESC
+		LIMIT $2
+	`
+
+	rows, err := r.db.QueryContext(ctx, query, monitorID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list check results for monitor %q: %w", monitorID, err)
+	}
+	defer rows.Close()
+
+	results := make([]checker.CheckResult, 0)
+	for rows.Next() {
+		var (
+			rawID        int64
+			mID          string
+			ok           bool
+			statusCode   sql.NullInt64
+			latencyMs    int64
+			errorClass   sql.NullString
+			errorDetail  sql.NullString
+			attemptCount int
+			checkedAt    time.Time
+		)
+
+		err := rows.Scan(
+			&rawID,
+			&mID,
+			&ok,
+			&statusCode,
+			&latencyMs,
+			&errorClass,
+			&errorDetail,
+			&attemptCount,
+			&checkedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan check result for monitor %q: %w", monitorID, err)
+		}
+
+		res := checker.CheckResult{
+			ID:           strconv.FormatInt(rawID, 10),
+			MonitorID:    mID,
+			CheckedAt:    checkedAt,
+			OK:           ok,
+			Latency:      time.Duration(latencyMs) * time.Millisecond,
+			AttemptCount: attemptCount,
+		}
+		if statusCode.Valid {
+			res.StatusCode = int(statusCode.Int64)
+		}
+		if errorClass.Valid {
+			res.ErrorClass = checker.ErrorClass(errorClass.String)
+		}
+		if errorDetail.Valid {
+			res.ErrorDetail = errorDetail.String
+		}
+
+		results = append(results, res)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate check results for monitor %q: %w", monitorID, err)
+	}
+
+	return results, nil
+}
+

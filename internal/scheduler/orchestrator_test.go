@@ -85,6 +85,23 @@ func (f *fakeRepository) CreateMonitor(ctx context.Context, m monitor.Monitor) e
 	return nil
 }
 
+func (f *fakeRepository) UpdateMonitor(ctx context.Context, m monitor.Monitor) error {
+	return nil
+}
+
+func (f *fakeRepository) DeleteMonitor(ctx context.Context, id string) error {
+	return nil
+}
+
+func (f *fakeRepository) ListCheckResults(ctx context.Context, monitorID string, limit int) ([]checker.CheckResult, error) {
+	return nil, nil
+}
+
+func (f *fakeRepository) GetStateWithTimestamp(ctx context.Context, monitorID string) (state.State, time.Time, error) {
+	st, err := f.GetState(ctx, monitorID)
+	return st, time.Now().UTC(), err
+}
+
 func (f *fakeRepository) SaveCycle(
 	ctx context.Context,
 	monitorID string,

@@ -2,6 +2,7 @@ package persistence
 
 import (
 	"context"
+	"time"
 
 	"github.com/chavaliadi/watchdog/internal/checker"
 	"github.com/chavaliadi/watchdog/internal/monitor"
@@ -15,6 +16,10 @@ type Repository interface {
 	ListMonitors(ctx context.Context) ([]monitor.Monitor, error)
 	GetState(ctx context.Context, monitorID string) (state.State, error)
 	CreateMonitor(ctx context.Context, m monitor.Monitor) error
+	UpdateMonitor(ctx context.Context, m monitor.Monitor) error
+	DeleteMonitor(ctx context.Context, id string) error
+	ListCheckResults(ctx context.Context, monitorID string, limit int) ([]checker.CheckResult, error)
+	GetStateWithTimestamp(ctx context.Context, monitorID string) (state.State, time.Time, error)
 	SaveCycle(
 		ctx context.Context,
 		monitorID string,

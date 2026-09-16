@@ -8,11 +8,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/chavaliadi/watchdog/internal/api"
 	"github.com/chavaliadi/watchdog/internal/checker"
 	"github.com/chavaliadi/watchdog/internal/monitor"
 	"github.com/chavaliadi/watchdog/internal/persistence"
 	"github.com/chavaliadi/watchdog/internal/retry"
 	"github.com/chavaliadi/watchdog/internal/scheduler"
+	"github.com/chavaliadi/watchdog/internal/service"
 	"github.com/chavaliadi/watchdog/internal/state"
 	"github.com/chavaliadi/watchdog/internal/worker"
 )
@@ -67,6 +69,40 @@ func (m *mockAppRepo) CreateMonitor(ctx context.Context, mon monitor.Monitor) er
 	defer m.mu.Unlock()
 	m.monitors = append(m.monitors, mon)
 	return nil
+}
+
+func (m *mockAppRepo) UpdateMonitor(ctx context.Context, mon monitor.Monitor) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, existing := range m.monitors {
+		if existing.ID == mon.ID {
+			m.monitors[i] = mon
+			return nil
+		}
+	}
+	return errors.New("not found")
+}
+
+func (m *mockAppRepo) DeleteMonitor(ctx context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, existing := range m.monitors {
+		if existing.ID == id {
+			m.monitors = append(m.monitors[:i], m.monitors[i+1:]...)
+			delete(m.states, id)
+			return nil
+		}
+	}
+	return errors.New("not found")
+}
+
+func (m *mockAppRepo) ListCheckResults(ctx context.Context, monitorID string, limit int) ([]checker.CheckResult, error) {
+	return []checker.CheckResult{}, nil
+}
+
+func (m *mockAppRepo) GetStateWithTimestamp(ctx context.Context, monitorID string) (state.State, time.Time, error) {
+	st, err := m.GetState(ctx, monitorID)
+	return st, time.Now().UTC(), err
 }
 
 func (m *mockAppRepo) SaveCycle(
@@ -151,6 +187,12 @@ func TestRun_DatabaseErrorsPropagate(t *testing.T) {
 	}
 }
 
+func testAPIServer(repo persistence.Repository, multiSched *scheduler.MultiScheduler) *api.Server {
+	svc := service.NewMonitorService(repo, multiSched)
+	handlers := api.NewHandlers(svc)
+	return api.NewServer(api.Config{Addr: "127.0.0.1:0"}, handlers)
+}
+
 func TestExecute_DiscoveryErrorsPropagate(t *testing.T) {
 	expectedErr := errors.New("database discovery failed")
 	repo := &mockAppRepo{
@@ -170,7 +212,7 @@ func TestExecute_DiscoveryErrorsPropagate(t *testing.T) {
 		t.Fatalf("create multi-scheduler: %v", err)
 	}
 
-	err = execute(context.Background(), multiSched)
+	err = execute(context.Background(), multiSched, testAPIServer(repo, multiSched))
 	if !errors.Is(err, expectedErr) {
 		t.Fatalf("expected discovery error %v, got %v", expectedErr, err)
 	}
@@ -229,7 +271,7 @@ func TestExecute_MultiMonitorDaemonLifecycle(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- execute(ctx, multiSched)
+		done <- execute(ctx, multiSched, testAPIServer(repo, multiSched))
 	}()
 
 	// Wait until both enabled monitors have executed their initial cycles
@@ -322,7 +364,7 @@ func TestExecute_HealthFailureRunsCleanly(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- execute(ctx, multiSched)
+		done <- execute(ctx, multiSched, testAPIServer(repo, multiSched))
 	}()
 
 	select {
@@ -345,3 +387,71 @@ func TestExecute_HealthFailureRunsCleanly(t *testing.T) {
 		t.Fatal("timed out waiting for daemon to shut down")
 	}
 }
+
+func TestLoadConfig_HTTPPort(t *testing.T) {
+	t.Setenv("WATCHDOG_DATABASE_URL", "postgres://user:pass@localhost:5432/db")
+
+	t.Run("default HTTP port", func(t *testing.T) {
+		t.Setenv("WATCHDOG_HTTP_PORT", "")
+		cfg, err := loadConfig()
+		if err != nil {
+			t.Fatalf("loadConfig failed: %v", err)
+		}
+		if cfg.HTTPPort != ":8080" {
+			t.Errorf("expected default port :8080, got %q", cfg.HTTPPort)
+		}
+	})
+
+	t.Run("custom HTTP port with colon", func(t *testing.T) {
+		t.Setenv("WATCHDOG_HTTP_PORT", ":9090")
+		cfg, err := loadConfig()
+		if err != nil {
+			t.Fatalf("loadConfig failed: %v", err)
+		}
+		if cfg.HTTPPort != ":9090" {
+			t.Errorf("expected :9090, got %q", cfg.HTTPPort)
+		}
+	})
+
+	t.Run("custom HTTP port without colon", func(t *testing.T) {
+		t.Setenv("WATCHDOG_HTTP_PORT", "9090")
+		cfg, err := loadConfig()
+		if err != nil {
+			t.Fatalf("loadConfig failed: %v", err)
+		}
+		if cfg.HTTPPort != ":9090" {
+			t.Errorf("expected :9090, got %q", cfg.HTTPPort)
+		}
+	})
+}
+
+func TestExecute_ServerBindFailure(t *testing.T) {
+	repo := &mockAppRepo{}
+	orch := scheduler.NewOrchestrator(nil, nil, retry.Config{}, repo)
+	pool, err := worker.NewPool(worker.Config{MaxConcurrency: 1}, orch)
+	if err != nil {
+		t.Fatalf("create pool: %v", err)
+	}
+
+	multiSched, err := scheduler.NewMultiScheduler(repo, pool)
+	if err != nil {
+		t.Fatalf("create multi-scheduler: %v", err)
+	}
+
+	// Create server with invalid bind address to force an immediate startup failure
+	svc := service.NewMonitorService(repo, multiSched)
+	handlers := api.NewHandlers(svc)
+	badServer := api.NewServer(api.Config{Addr: "999.999.999.999:99999"}, handlers)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err = execute(ctx, multiSched, badServer)
+	if err == nil {
+		t.Fatal("expected execute to fail with server bind error, got nil")
+	}
+	if !strings.Contains(err.Error(), "http server error") {
+		t.Errorf("expected 'http server error', got: %v", err)
+	}
+}
+

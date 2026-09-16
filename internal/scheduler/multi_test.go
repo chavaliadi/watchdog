@@ -82,6 +82,40 @@ func (m *mockMultiRepo) CreateMonitor(ctx context.Context, mon monitor.Monitor) 
 	return nil
 }
 
+func (m *mockMultiRepo) GetStateWithTimestamp(ctx context.Context, monitorID string) (state.State, time.Time, error) {
+	st, err := m.GetState(ctx, monitorID)
+	return st, time.Now().UTC(), err
+}
+
+func (m *mockMultiRepo) UpdateMonitor(ctx context.Context, mon monitor.Monitor) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, existing := range m.monitors {
+		if existing.ID == mon.ID {
+			m.monitors[i] = mon
+			return nil
+		}
+	}
+	return errors.New("not found")
+}
+
+func (m *mockMultiRepo) DeleteMonitor(ctx context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, existing := range m.monitors {
+		if existing.ID == id {
+			m.monitors = append(m.monitors[:i], m.monitors[i+1:]...)
+			delete(m.states, id)
+			return nil
+		}
+	}
+	return errors.New("not found")
+}
+
+func (m *mockMultiRepo) ListCheckResults(ctx context.Context, monitorID string, limit int) ([]checker.CheckResult, error) {
+	return []checker.CheckResult{}, nil
+}
+
 func (m *mockMultiRepo) SaveCycle(ctx context.Context, monitorID string, result checker.CheckResult, nextState state.State) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -786,3 +820,264 @@ func TestMultiScheduler_CancellationAndShutdown(t *testing.T) {
 		}
 	})
 }
+
+func TestMultiScheduler_RuntimeReconciliation(t *testing.T) {
+	t.Run("dynamic StartMonitor and StopMonitor", func(t *testing.T) {
+		repo := newMockMultiRepo()
+		runner := newMockCycleRunner()
+		ms, err := scheduler.NewMultiScheduler(repo, runner)
+		if err != nil {
+			t.Fatalf("NewMultiScheduler failed: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		if err := ms.Start(ctx); err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		defer ms.Stop()
+
+		m := monitor.Monitor{
+			ID:       "dyn-1",
+			Enabled:  true,
+			Interval: 1 * time.Hour,
+		}
+		repo.addMonitor(m, state.StateHealthy)
+
+		if err := ms.StartMonitor(ctx, m); err != nil {
+			t.Fatalf("StartMonitor failed: %v", err)
+		}
+
+		if !ms.HasRunner("dyn-1") {
+			t.Fatal("expected HasRunner('dyn-1') to be true")
+		}
+		if count := ms.ActiveRunners(); count != 1 {
+			t.Fatalf("expected 1 active runner, got %d", count)
+		}
+
+		// Immediate first execution should have run
+		time.Sleep(20 * time.Millisecond)
+		runner.mu.Lock()
+		calls := len(runner.calls["dyn-1"])
+		runner.mu.Unlock()
+		if calls < 1 {
+			t.Fatalf("expected at least 1 cycle run, got %d", calls)
+		}
+
+		// Starting duplicate runner returns ErrRunnerAlreadyExists
+		if err := ms.StartMonitor(ctx, m); !errors.Is(err, scheduler.ErrRunnerAlreadyExists) {
+			t.Fatalf("expected ErrRunnerAlreadyExists, got %v", err)
+		}
+
+		// Stop runner synchronously
+		if err := ms.StopMonitor(ctx, "dyn-1"); err != nil {
+			t.Fatalf("StopMonitor failed: %v", err)
+		}
+		if ms.HasRunner("dyn-1") {
+			t.Fatal("expected HasRunner('dyn-1') to be false after stop")
+		}
+		if count := ms.ActiveRunners(); count != 0 {
+			t.Fatalf("expected 0 active runners, got %d", count)
+		}
+	})
+
+	t.Run("dynamic UpdateMonitor config change and interval change", func(t *testing.T) {
+		repo := newMockMultiRepo()
+		var cycleCount int64
+		cycleTriggered := make(chan struct{}, 10)
+
+		runner := newMockCycleRunner()
+		runner.cycleFn = func(ctx context.Context, m monitor.Monitor, current state.State) (scheduler.CycleResult, error) {
+			atomic.AddInt64(&cycleCount, 1)
+			select {
+			case cycleTriggered <- struct{}{}:
+			default:
+			}
+			return scheduler.CycleResult{
+				TransitionResult: state.TransitionResult{NextState: state.StateHealthy},
+			}, nil
+		}
+
+		ms, err := scheduler.NewMultiScheduler(repo, runner)
+		if err != nil {
+			t.Fatalf("NewMultiScheduler failed: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		if err := ms.Start(ctx); err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		defer ms.Stop()
+
+		m := monitor.Monitor{
+			ID:       "dyn-update",
+			Enabled:  true,
+			Interval: 1 * time.Hour,
+		}
+		repo.addMonitor(m, state.StateHealthy)
+
+		if err := ms.StartMonitor(ctx, m); err != nil {
+			t.Fatalf("StartMonitor failed: %v", err)
+		}
+		<-cycleTriggered
+
+		// Update monitor with new interval (and enabled=true)
+		mUpdated := monitor.Monitor{
+			ID:       "dyn-update",
+			Enabled:  true,
+			Interval: 20 * time.Millisecond,
+		}
+		if err := ms.UpdateMonitor(ctx, mUpdated); err != nil {
+			t.Fatalf("UpdateMonitor failed: %v", err)
+		}
+
+		// New runner immediately runs first cycle
+		select {
+		case <-cycleTriggered:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("timed out waiting for new runner immediate cycle")
+		}
+
+		// And then runs on the new 20ms fixed-delay interval
+		select {
+		case <-cycleTriggered:
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("timed out waiting for second cycle on new interval")
+		}
+
+		// Disable via UpdateMonitor
+		mDisabled := monitor.Monitor{
+			ID:       "dyn-update",
+			Enabled:  false,
+			Interval: 20 * time.Millisecond,
+		}
+		if err := ms.UpdateMonitor(ctx, mDisabled); err != nil {
+			t.Fatalf("UpdateMonitor disabled failed: %v", err)
+		}
+		if ms.HasRunner("dyn-update") {
+			t.Fatal("expected no runner after disabling via UpdateMonitor")
+		}
+	})
+
+	t.Run("StopMonitor is synchronous and waits for runner termination", func(t *testing.T) {
+		repo := newMockMultiRepo()
+		inCycle := make(chan struct{})
+		allowCycleFinish := make(chan struct{})
+
+		runner := newMockCycleRunner()
+		runner.cycleFn = func(ctx context.Context, m monitor.Monitor, current state.State) (scheduler.CycleResult, error) {
+			close(inCycle)
+			<-allowCycleFinish
+			return scheduler.CycleResult{
+				TransitionResult: state.TransitionResult{NextState: state.StateHealthy},
+			}, nil
+		}
+
+		ms, err := scheduler.NewMultiScheduler(repo, runner)
+		if err != nil {
+			t.Fatalf("NewMultiScheduler failed: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		if err := ms.Start(ctx); err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		defer ms.Stop()
+
+		m := monitor.Monitor{
+			ID:       "sync-stop",
+			Enabled:  true,
+			Interval: 1 * time.Hour,
+		}
+		repo.addMonitor(m, state.StateUnknown)
+
+		if err := ms.StartMonitor(ctx, m); err != nil {
+			t.Fatalf("StartMonitor failed: %v", err)
+		}
+
+		// Wait until runner is inside cycle execution
+		<-inCycle
+
+		stopFinished := make(chan struct{})
+		go func() {
+			if err := ms.StopMonitor(ctx, "sync-stop"); err != nil {
+				t.Errorf("StopMonitor failed: %v", err)
+			}
+			close(stopFinished)
+		}()
+
+		// Verify stop has NOT finished yet because runner hasn't terminated
+		select {
+		case <-stopFinished:
+			t.Fatal("StopMonitor finished before runner terminated!")
+		case <-time.After(30 * time.Millisecond):
+			// Expected
+		}
+
+		// Now allow cycle to finish
+		close(allowCycleFinish)
+
+		select {
+		case <-stopFinished:
+			// Success: StopMonitor waited and finished after runner termination
+		case <-time.After(1 * time.Second):
+			t.Fatal("StopMonitor did not finish after cycle completed")
+		}
+	})
+
+	t.Run("concurrent lifecycle operations on same monitor", func(t *testing.T) {
+		repo := newMockMultiRepo()
+		runner := newMockCycleRunner()
+		ms, err := scheduler.NewMultiScheduler(repo, runner)
+		if err != nil {
+			t.Fatalf("NewMultiScheduler failed: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		if err := ms.Start(ctx); err != nil {
+			t.Fatalf("Start failed: %v", err)
+		}
+		defer ms.Stop()
+
+		m := monitor.Monitor{
+			ID:       "racing-mon",
+			Enabled:  true,
+			Interval: 100 * time.Millisecond,
+		}
+		repo.addMonitor(m, state.StateHealthy)
+
+		const ops = 30
+		var wg sync.WaitGroup
+		wg.Add(ops)
+
+		for i := 0; i < ops; i++ {
+			go func(idx int) {
+				defer wg.Done()
+				switch idx % 4 {
+				case 0:
+					_ = ms.StartMonitor(ctx, m)
+				case 1:
+					_ = ms.StopMonitor(ctx, m.ID)
+				case 2:
+					_ = ms.UpdateMonitor(ctx, m)
+				case 3:
+					mDis := m
+					mDis.Enabled = false
+					_ = ms.UpdateMonitor(ctx, mDis)
+				}
+			}(i)
+		}
+
+		wg.Wait()
+
+		// Final check: active runner count is either 0 or 1, never > 1
+		runners := ms.ActiveRunners()
+		if runners > 1 {
+			t.Fatalf("expected at most 1 runner, got %d", runners)
+		}
+	})
+}
+
