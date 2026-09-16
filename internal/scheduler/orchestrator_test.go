@@ -8,6 +8,7 @@ import (
 
 	"github.com/chavaliadi/watchdog/internal/checker"
 	"github.com/chavaliadi/watchdog/internal/monitor"
+	"github.com/chavaliadi/watchdog/internal/persistence"
 	"github.com/chavaliadi/watchdog/internal/retry"
 	"github.com/chavaliadi/watchdog/internal/state"
 )
@@ -46,6 +47,52 @@ func testRetryConfig() retry.Config {
 			return d
 		},
 	}
+}
+
+type saveCycleCall struct {
+	monitorID   string
+	checkResult checker.CheckResult
+	nextState   state.State
+}
+
+type fakeRepository struct {
+	getMonitorCalls    int
+	getStateCalls      int
+	createMonitorCalls int
+	saveCycleCalls     []saveCycleCall
+
+	saveCycleErr error
+}
+
+var _ persistence.Repository = (*fakeRepository)(nil)
+
+func (f *fakeRepository) GetMonitor(ctx context.Context, id string) (monitor.Monitor, error) {
+	f.getMonitorCalls++
+	return monitor.Monitor{ID: id}, nil
+}
+
+func (f *fakeRepository) GetState(ctx context.Context, monitorID string) (state.State, error) {
+	f.getStateCalls++
+	return state.StateUnknown, nil
+}
+
+func (f *fakeRepository) CreateMonitor(ctx context.Context, m monitor.Monitor) error {
+	f.createMonitorCalls++
+	return nil
+}
+
+func (f *fakeRepository) SaveCycle(
+	ctx context.Context,
+	monitorID string,
+	result checker.CheckResult,
+	nextState state.State,
+) error {
+	f.saveCycleCalls = append(f.saveCycleCalls, saveCycleCall{
+		monitorID:   monitorID,
+		checkResult: result,
+		nextState:   nextState,
+	})
+	return f.saveCycleErr
 }
 
 func TestOrchestrator_HTTPRouting(t *testing.T) {
@@ -386,5 +433,297 @@ func TestOrchestrator_RetryAttemptsRespected(t *testing.T) {
 	}
 	if res.TransitionResult.NextState != state.StateHealthy {
 		t.Errorf("expected NextState HEALTHY, got %q", res.TransitionResult.NextState)
+	}
+}
+
+func TestOrchestrator_PersistentHTTPCycle_Success(t *testing.T) {
+	httpMock := &mockChecker{
+		results: []checker.CheckResult{{OK: true, StatusCode: 200, Latency: 45 * time.Millisecond}},
+		errs:    []error{nil},
+	}
+	tcpMock := &mockChecker{}
+	repo := &fakeRepository{}
+
+	o := NewOrchestrator(httpMock, tcpMock, testRetryConfig(), repo)
+
+	m := monitor.Monitor{
+		ID:        "mon-http-persist",
+		Kind:      monitor.KindHTTP,
+		TargetURL: "https://example.com",
+	}
+
+	res, err := o.RunCycle(context.Background(), m, state.StateUnknown)
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+
+	if httpMock.calls != 1 {
+		t.Errorf("expected 1 HTTP checker call, got %d", httpMock.calls)
+	}
+	if res.TransitionResult.NextState != state.StateHealthy {
+		t.Errorf("expected next state HEALTHY, got %q", res.TransitionResult.NextState)
+	}
+
+	if len(repo.saveCycleCalls) != 1 {
+		t.Fatalf("expected 1 SaveCycle call, got %d", len(repo.saveCycleCalls))
+	}
+	call := repo.saveCycleCalls[0]
+	if call.monitorID != m.ID {
+		t.Errorf("expected monitor ID %q, got %q", m.ID, call.monitorID)
+	}
+	if !call.checkResult.OK || call.checkResult.StatusCode != 200 {
+		t.Errorf("expected CheckResult OK=true StatusCode=200, got OK=%v StatusCode=%d", call.checkResult.OK, call.checkResult.StatusCode)
+	}
+	if call.nextState != state.StateHealthy {
+		t.Errorf("expected SaveCycle nextState HEALTHY, got %q", call.nextState)
+	}
+}
+
+func TestOrchestrator_PersistentHTTPCycle_Failure(t *testing.T) {
+	httpMock := &mockChecker{
+		results: []checker.CheckResult{
+			{OK: false, StatusCode: 500, ErrorClass: checker.ErrorClassStatus},
+			{OK: false, StatusCode: 500, ErrorClass: checker.ErrorClassStatus},
+			{OK: false, StatusCode: 500, ErrorClass: checker.ErrorClassStatus},
+		},
+		errs: []error{nil, nil, nil},
+	}
+	tcpMock := &mockChecker{}
+	repo := &fakeRepository{}
+
+	o := NewOrchestrator(httpMock, tcpMock, testRetryConfig(), repo)
+
+	m := monitor.Monitor{
+		ID:        "mon-http-fail",
+		Kind:      monitor.KindHTTP,
+		TargetURL: "https://example.com/failing",
+	}
+
+	res, err := o.RunCycle(context.Background(), m, state.StateHealthy)
+	if err != nil {
+		t.Fatalf("expected nil error for target failure, got: %v", err)
+	}
+
+	if res.CheckResult.OK {
+		t.Errorf("expected CheckResult.OK to be false")
+	}
+	if res.TransitionResult.NextState != state.StateUnhealthy {
+		t.Errorf("expected transition to UNHEALTHY, got %q", res.TransitionResult.NextState)
+	}
+
+	if len(repo.saveCycleCalls) != 1 {
+		t.Fatalf("expected 1 SaveCycle call, got %d", len(repo.saveCycleCalls))
+	}
+	call := repo.saveCycleCalls[0]
+	if call.monitorID != m.ID {
+		t.Errorf("expected monitor ID %q, got %q", m.ID, call.monitorID)
+	}
+	if call.nextState != state.StateUnhealthy {
+		t.Errorf("expected SaveCycle with UNHEALTHY, got %q", call.nextState)
+	}
+}
+
+func TestOrchestrator_PersistentHTTPCycle_Recovery(t *testing.T) {
+	httpMock := &mockChecker{
+		results: []checker.CheckResult{{OK: true, StatusCode: 200}},
+		errs:    []error{nil},
+	}
+	tcpMock := &mockChecker{}
+	repo := &fakeRepository{}
+
+	o := NewOrchestrator(httpMock, tcpMock, testRetryConfig(), repo)
+
+	m := monitor.Monitor{
+		ID:        "mon-http-recover",
+		Kind:      monitor.KindHTTP,
+		TargetURL: "https://example.com/recovered",
+	}
+
+	res, err := o.RunCycle(context.Background(), m, state.StateUnhealthy)
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+
+	if res.TransitionResult.NextState != state.StateHealthy {
+		t.Errorf("expected next state HEALTHY, got %q", res.TransitionResult.NextState)
+	}
+
+	if len(repo.saveCycleCalls) != 1 {
+		t.Fatalf("expected 1 SaveCycle call, got %d", len(repo.saveCycleCalls))
+	}
+	if repo.saveCycleCalls[0].nextState != state.StateHealthy {
+		t.Errorf("expected SaveCycle with nextState HEALTHY, got %q", repo.saveCycleCalls[0].nextState)
+	}
+}
+
+func TestOrchestrator_PersistentTCPCycle_Success(t *testing.T) {
+	httpMock := &mockChecker{}
+	tcpMock := &mockChecker{
+		results: []checker.CheckResult{{OK: true, Latency: 15 * time.Millisecond}},
+		errs:    []error{nil},
+	}
+	repo := &fakeRepository{}
+
+	o := NewOrchestrator(httpMock, tcpMock, testRetryConfig(), repo)
+
+	m := monitor.Monitor{
+		ID:        "mon-tcp-persist",
+		Kind:      monitor.KindTCP,
+		TargetURL: "127.0.0.1:5432",
+	}
+
+	res, err := o.RunCycle(context.Background(), m, state.StateUnknown)
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+
+	if tcpMock.calls != 1 {
+		t.Errorf("expected 1 TCP checker call, got %d", tcpMock.calls)
+	}
+	if res.TransitionResult.NextState != state.StateHealthy {
+		t.Errorf("expected next state HEALTHY, got %q", res.TransitionResult.NextState)
+	}
+
+	if len(repo.saveCycleCalls) != 1 {
+		t.Fatalf("expected 1 SaveCycle call, got %d", len(repo.saveCycleCalls))
+	}
+	call := repo.saveCycleCalls[0]
+	if call.monitorID != m.ID {
+		t.Errorf("expected monitor ID %q, got %q", m.ID, call.monitorID)
+	}
+	if call.nextState != state.StateHealthy {
+		t.Errorf("expected SaveCycle with HEALTHY, got %q", call.nextState)
+	}
+}
+
+func TestOrchestrator_PersistentCycle_CheckerExecutionError(t *testing.T) {
+	execErr := errors.New("network dial failed")
+	httpMock := &mockChecker{
+		results: []checker.CheckResult{{}},
+		errs:    []error{execErr},
+	}
+	tcpMock := &mockChecker{}
+	repo := &fakeRepository{}
+
+	o := NewOrchestrator(httpMock, tcpMock, testRetryConfig(), repo)
+
+	m := monitor.Monitor{
+		ID:        "mon-checker-err",
+		Kind:      monitor.KindHTTP,
+		TargetURL: "https://invalid.example.com",
+	}
+
+	_, err := o.RunCycle(context.Background(), m, state.StateHealthy)
+	if !errors.Is(err, execErr) {
+		t.Fatalf("expected execErr, got: %v", err)
+	}
+
+	if len(repo.saveCycleCalls) != 0 {
+		t.Errorf("expected 0 SaveCycle calls when checker returns Go error, got %d", len(repo.saveCycleCalls))
+	}
+}
+
+func TestOrchestrator_PersistentCycle_PersistenceError(t *testing.T) {
+	httpMock := &mockChecker{
+		results: []checker.CheckResult{{OK: true, StatusCode: 200}},
+		errs:    []error{nil},
+	}
+	tcpMock := &mockChecker{}
+
+	dbErr := errors.New("database connection broken")
+	repo := &fakeRepository{
+		saveCycleErr: dbErr,
+	}
+
+	o := NewOrchestrator(httpMock, tcpMock, testRetryConfig(), repo)
+
+	m := monitor.Monitor{
+		ID:        "mon-persist-err",
+		Kind:      monitor.KindHTTP,
+		TargetURL: "https://example.com",
+	}
+
+	res, err := o.RunCycle(context.Background(), m, state.StateUnknown)
+	if err == nil {
+		t.Fatal("expected error on persistence failure, got nil")
+	}
+	if !errors.Is(err, dbErr) {
+		t.Fatalf("expected error wrapping dbErr, got: %v", err)
+	}
+
+	// Must NOT return successful CycleResult
+	if res.CheckResult.OK {
+		t.Errorf("expected empty/failed CycleResult, got %+v", res)
+	}
+
+	// Checker must have run
+	if httpMock.calls != 1 {
+		t.Errorf("expected 1 checker call, got %d", httpMock.calls)
+	}
+
+	// SaveCycle was called exactly once (not retried)
+	if len(repo.saveCycleCalls) != 1 {
+		t.Errorf("expected exactly 1 SaveCycle call without retry, got %d", len(repo.saveCycleCalls))
+	}
+}
+
+func TestOrchestrator_PersistentCycle_UnsupportedMonitorKind(t *testing.T) {
+	httpMock := &mockChecker{}
+	tcpMock := &mockChecker{}
+	repo := &fakeRepository{}
+
+	o := NewOrchestrator(httpMock, tcpMock, testRetryConfig(), repo)
+
+	m := monitor.Monitor{
+		ID:        "mon-unsupported",
+		Kind:      monitor.KindHealth,
+		TargetURL: "https://example.com",
+	}
+
+	_, err := o.RunCycle(context.Background(), m, state.StateHealthy)
+	if err == nil {
+		t.Fatal("expected error for unsupported monitor kind, got nil")
+	}
+
+	if httpMock.calls != 0 {
+		t.Errorf("expected 0 HTTP checker calls, got %d", httpMock.calls)
+	}
+	if tcpMock.calls != 0 {
+		t.Errorf("expected 0 TCP checker calls, got %d", tcpMock.calls)
+	}
+	if len(repo.saveCycleCalls) != 0 {
+		t.Errorf("expected 0 SaveCycle calls, got %d", len(repo.saveCycleCalls))
+	}
+}
+
+func TestOrchestrator_PersistentCycle_ContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel before RunCycle
+
+	httpMock := &mockChecker{
+		results: []checker.CheckResult{{OK: true}},
+		errs:    []error{nil},
+	}
+	tcpMock := &mockChecker{}
+	repo := &fakeRepository{}
+
+	o := NewOrchestrator(httpMock, tcpMock, testRetryConfig(), repo)
+
+	m := monitor.Monitor{
+		ID:        "mon-canceled-persist",
+		Kind:      monitor.KindHTTP,
+		TargetURL: "https://example.com",
+	}
+
+	_, err := o.RunCycle(ctx, m, state.StateHealthy)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got: %v", err)
+	}
+
+	if httpMock.calls != 0 {
+		t.Errorf("expected 0 checker calls on canceled context, got %d", httpMock.calls)
+	}
+	if len(repo.saveCycleCalls) != 0 {
+		t.Errorf("expected 0 SaveCycle calls on canceled context, got %d", len(repo.saveCycleCalls))
 	}
 }
