@@ -15,16 +15,16 @@ Modern software deployments frequently suffer from silent outages: portfolio sit
 ## Current Status
 
 * **Phase 1–6 Complete**: Core engine, PostgreSQL persistence, application runtime, bounded worker pool scheduling, REST API lifecycle management, and React management dashboard are fully implemented and verified.
-* **Next Phase**: **Phase 7 — Observability** (structured logging, metrics export, OpenTelemetry tracing, and alerting).
+* **Next Phase**: **Phase 7 — Observability** (structured logging, metrics, health/readiness, and instrumentation).
 
 ---
 
 ## Core Features
 
-* **HTTP Health Checks**: Probes HTTP/HTTPS targets with configurable verbs (`GET`, `POST`, `PUT`, `HEAD`, `DELETE`, `PATCH`), expected status code matching (single code or ranges such as `200-299`), and microsecond-level latency measurement.
+* **HTTP Health Checks**: Probes HTTP/HTTPS targets with configurable verbs (`GET`, `POST`, `PUT`, `HEAD`, `DELETE`, `PATCH`), expected status code matching (single code or ranges such as `200-299`), and millisecond-level latency measurement.
 * **TCP Connectivity Checks**: Connects to raw `host:port` targets to verify network reachability, socket handshakes, and transport availability.
 * **Context-Aware Execution & Timeouts**: Strict per-check timeout enforcement with context cancellation across all network I/O.
-* **Deterministic Retry Engine**: Retries failed attempts with exponential backoff and randomized jitter before recording a confirmed failure.
+* **Bounded Retry Engine**: Retries failed attempts with exponential backoff and randomized jitter before recording a confirmed failure.
 * **State Machine Evaluation**: Maintains authoritative health state (`UNKNOWN`, `HEALTHY`, `UNHEALTHY`) with explicit transition rules.
 * **Transactional PostgreSQL Persistence**: Atomic state updates and check result insertions within database transactions.
 * **Per-Monitor Independent Runners**: Each active monitor operates on its own recurring schedule without cross-monitor blocking.
@@ -33,7 +33,7 @@ Modern software deployments frequently suffer from silent outages: portfolio sit
 * **REST API**: Built with Go's standard library `net/http` pattern matching, offering structured JSON error envelopes and status mapping.
 * **React Management Dashboard**: Vite + React 19 + TypeScript SPA with live health summary cards, responsive tabular views, inline controls, and check history inspection.
 * **Dynamic Polling**: Automatic UI synchronization that adapts to each monitor's configured interval while pausing background network activity when tabs are hidden.
-* **Graceful Shutdown**: Intercepts `SIGINT` / `SIGTERM` signals to cleanly drain the worker pool, stop active scheduler runners, and shut down the HTTP server without dropped checks.
+* **Graceful Shutdown**: Intercepts `SIGINT` / `SIGTERM` signals to gracefully drain in-flight work, stop scheduler runners, and shut down the HTTP server.
 * **Race & Concurrency Safe**: Verified with the Go race detector (`go test -race ./...`).
 
 ---
@@ -184,7 +184,7 @@ Health state is tracked separately in `monitor_states` and transitions determini
 Transient network blips should not trigger false alarms. Deployment Watchdog incorporates an internal retry loop before recording a failed cycle:
 
 * **Bounded Attempts**: Up to 3 attempts per cycle.
-* **Exponential Backoff**: Increasing delay between attempts ($100\text{ms} \times 2^{\text{attempt}}$).
+* **Exponential Backoff**: Increasing delay between attempts, starting from a 100ms base delay and capped at the configured maximum.
 * **Randomized Jitter**: Prevents synchronized retry storms across concurrent checks.
 * **Cancellation Awareness**: If the monitor's overall timeout expires or the server initiates a shutdown, retries abort immediately.
 * **Execution Errors vs Target Failures**: Domain configuration errors (e.g. malformed URLs) fail immediately without wasteful retries.
@@ -401,7 +401,7 @@ npm run build
 * **Authentication & Authorization**: The REST API and dashboard are currently unauthenticated (designed for internal infrastructure networks).
 * **Dashboard N+1 Status Requests**: The dashboard fetches the monitor list followed by concurrent status queries per monitor. Acceptable for current scope, documented for future optimization via SQL join.
 * **Polling-Based Updates**: Real-time streaming via WebSockets or Server-Sent Events is not yet supported.
-* **Observability Features Pending**: Structured metrics export (Prometheus/OpenTelemetry) and alerting integrations (SNS/webhooks) are planned for Phase 7.
+* **Observability Features Pending**: Structured logging, metrics, health/readiness, and instrumentation are planned for Phase 7.
 
 ---
 
