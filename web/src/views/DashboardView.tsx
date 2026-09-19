@@ -135,6 +135,7 @@ export const DashboardView: React.FC = () => {
         onToggleEnabled={handleToggleEnabled}
         onCreateClick={() => setIsCreateOpen(true)}
         togglingId={togglingId}
+        isFiltered={Boolean(search.trim()) || kindFilter !== 'all' || statusFilter !== 'all'}
       />
 
       {/* Create Modal */}

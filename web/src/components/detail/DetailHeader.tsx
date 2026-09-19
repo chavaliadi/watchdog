@@ -1,7 +1,7 @@
 import React from 'react';
 import { Link } from 'react-router-dom';
 import { ChevronLeft, Edit2, Trash2, RefreshCw, Power } from 'lucide-react';
-import { HealthBadge, KindBadge } from '../common/Badge';
+import { HealthBadge, KindBadge, PausedBadge } from '../common/Badge';
 import { Button } from '../common/Button';
 import { formatRelativeTime, formatUtcDateTime } from '../../utils/formatters';
 import type { Monitor } from '../../types/monitor';
@@ -34,7 +34,7 @@ export const DetailHeader: React.FC<DetailHeaderProps> = ({
       <div>
         <Link
           to="/"
-          className="inline-flex items-center gap-1 text-xs font-medium text-zinc-400 hover:text-zinc-200 transition-colors"
+          className="inline-flex items-center gap-1.5 text-xs font-medium text-zinc-400 hover:text-zinc-200 transition-colors"
         >
           <ChevronLeft className="w-4 h-4" />
           <span>Back to Dashboard</span>
@@ -49,11 +49,10 @@ export const DetailHeader: React.FC<DetailHeaderProps> = ({
               {monitor.name}
             </h1>
             <KindBadge kind={monitor.kind} size="md" />
-            <HealthBadge state={status?.state} size="md" />
-            {!monitor.enabled && (
-              <span className="px-2 py-0.5 rounded text-xs font-medium bg-zinc-800 text-zinc-400 border border-zinc-700">
-                SCHEDULING PAUSED
-              </span>
+            {monitor.enabled ? (
+              <HealthBadge state={status?.state} size="md" />
+            ) : (
+              <PausedBadge size="md" />
             )}
           </div>
           <p className="text-xs sm:text-sm font-mono text-zinc-400 truncate max-w-2xl">

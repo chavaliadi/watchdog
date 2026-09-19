@@ -1,6 +1,6 @@
 import { render, screen } from '@testing-library/react';
 import { describe, it, expect } from 'vitest';
-import { HealthBadge, KindBadge } from '../components/common/Badge';
+import { HealthBadge, KindBadge, PausedBadge } from '../components/common/Badge';
 
 describe('HealthBadge', () => {
   it('renders HEALTHY badge with label and icon', () => {
@@ -21,6 +21,13 @@ describe('HealthBadge', () => {
   it('defaults undefined to UNKNOWN', () => {
     render(<HealthBadge state={undefined} />);
     expect(screen.getByText('UNKNOWN')).toBeInTheDocument();
+  });
+});
+
+describe('PausedBadge', () => {
+  it('renders PAUSED badge with label and pause icon', () => {
+    render(<PausedBadge />);
+    expect(screen.getByText('PAUSED')).toBeInTheDocument();
   });
 });
 
