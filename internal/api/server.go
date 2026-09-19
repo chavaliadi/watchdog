@@ -28,6 +28,8 @@ func NewServer(cfg Config, handlers *Handlers) *Server {
 	mux.HandleFunc("DELETE /monitors/{id}", handlers.DeleteMonitor)
 	mux.HandleFunc("GET /monitors/{id}/status", handlers.GetMonitorStatus)
 	mux.HandleFunc("GET /monitors/{id}/checks", handlers.GetMonitorChecks)
+	mux.HandleFunc("GET /livez", handlers.Livez)
+	mux.HandleFunc("GET /readyz", handlers.Readyz)
 
 	readTimeout := cfg.ReadTimeout
 	if readTimeout <= 0 {

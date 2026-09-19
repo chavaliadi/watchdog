@@ -10,11 +10,30 @@ import (
 )
 
 type Handlers struct {
-	svc *service.MonitorService
+	svc          *service.MonitorService
+	dbChecker    DBHealthChecker
+	schedChecker SchedulerHealthChecker
+	drainChecker DrainChecker
 }
 
-func NewHandlers(svc *service.MonitorService) *Handlers {
-	return &Handlers{svc: svc}
+// HandlerOption configures optional dependencies on Handlers.
+type HandlerOption func(*Handlers)
+
+// WithHealthChecks configures the health and readiness dependencies on Handlers.
+func WithHealthChecks(db DBHealthChecker, sched SchedulerHealthChecker, drain DrainChecker) HandlerOption {
+	return func(h *Handlers) {
+		h.dbChecker = db
+		h.schedChecker = sched
+		h.drainChecker = drain
+	}
+}
+
+func NewHandlers(svc *service.MonitorService, opts ...HandlerOption) *Handlers {
+	h := &Handlers{svc: svc}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
 }
 
 // CreateMonitor handles POST /monitors

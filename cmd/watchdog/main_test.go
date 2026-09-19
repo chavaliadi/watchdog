@@ -472,3 +472,55 @@ func TestExecute_ServerBindFailure(t *testing.T) {
 	}
 }
 
+func TestExecute_DrainingOnShutdown(t *testing.T) {
+	repo := &mockAppRepo{
+		listMonitorsFn: func(ctx context.Context) ([]monitor.Monitor, error) {
+			return []monitor.Monitor{}, nil
+		},
+	}
+	orch := scheduler.NewOrchestrator(nil, nil, retry.Config{}, repo)
+	pool, err := worker.NewPool(worker.Config{MaxConcurrency: 2}, orch)
+	if err != nil {
+		t.Fatalf("unexpected pool error: %v", err)
+	}
+	multiSched, err := scheduler.NewMultiScheduler(repo, pool)
+	if err != nil {
+		t.Fatalf("unexpected scheduler error: %v", err)
+	}
+
+	drainTracker := &api.DrainTracker{}
+	svc := service.NewMonitorService(repo, multiSched)
+	handlers := api.NewHandlers(svc, api.WithHealthChecks(nil, multiSched, drainTracker))
+	server := api.NewServer(api.Config{Addr: "127.0.0.1:0"}, handlers)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan error, 1)
+	go func() {
+		done <- execute(ctx, multiSched, server, drainTracker)
+	}()
+
+	// Give components a brief moment to start
+	time.Sleep(50 * time.Millisecond)
+
+	if drainTracker.IsDraining() {
+		t.Errorf("expected drainTracker to be false before shutdown")
+	}
+
+	// Trigger graceful shutdown
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("execute failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("execute did not complete within timeout")
+	}
+
+	if !drainTracker.IsDraining() {
+		t.Errorf("expected drainTracker to be true after shutdown initiation")
+	}
+}
+

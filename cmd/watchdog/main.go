@@ -131,7 +131,11 @@ func run(ctx context.Context) error {
 	}
 
 	monitorSvc := service.NewMonitorService(repo, multiSched)
-	handlers := api.NewHandlers(monitorSvc)
+	drainTracker := &api.DrainTracker{}
+	handlers := api.NewHandlers(
+		monitorSvc,
+		api.WithHealthChecks(db, multiSched, drainTracker),
+	)
 	apiServer := api.NewServer(api.Config{Addr: cfg.HTTPPort}, handlers)
 
 	slog.Info("deployment-watchdog running",
@@ -139,10 +143,15 @@ func run(ctx context.Context) error {
 		"concurrency", cfg.WorkerConcurrency,
 		"http_port", cfg.HTTPPort,
 	)
-	return execute(ctx, multiSched, apiServer)
+	return execute(ctx, multiSched, apiServer, drainTracker)
 }
 
-func execute(ctx context.Context, multiSched *scheduler.MultiScheduler, apiServer *api.Server) error {
+func execute(ctx context.Context, multiSched *scheduler.MultiScheduler, apiServer *api.Server, drainTrackers ...*api.DrainTracker) error {
+	var drainTracker *api.DrainTracker
+	if len(drainTrackers) > 0 {
+		drainTracker = drainTrackers[0]
+	}
+
 	if err := multiSched.Start(ctx); err != nil {
 		return fmt.Errorf("multi-scheduler start: %w", err)
 	}
@@ -158,9 +167,15 @@ func execute(ctx context.Context, multiSched *scheduler.MultiScheduler, apiServe
 	var runErr error
 	select {
 	case <-ctx.Done():
+		if drainTracker != nil {
+			drainTracker.SetDraining()
+		}
 		slog.Info("shutdown signal received, initiating graceful shutdown", telemetry.AttrComponent, "main")
 	case err := <-serverErr:
 		if err != nil {
+			if drainTracker != nil {
+				drainTracker.SetDraining()
+			}
 			runErr = fmt.Errorf("http server error: %w", err)
 			slog.Error("http server error, initiating shutdown", telemetry.AttrComponent, "main", telemetry.AttrError, err)
 		}

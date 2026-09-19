@@ -1081,3 +1081,34 @@ func TestMultiScheduler_RuntimeReconciliation(t *testing.T) {
 	})
 }
 
+func TestMultiScheduler_IsRunning(t *testing.T) {
+	repo := newMockMultiRepo()
+	runner := newMockCycleRunner()
+	ms, err := scheduler.NewMultiScheduler(repo, runner)
+	if err != nil {
+		t.Fatalf("unexpected error creating MultiScheduler: %v", err)
+	}
+
+	// 1. Initial state before Start: IsRunning must be false
+	if ms.IsRunning() {
+		t.Errorf("expected IsRunning to be false before Start")
+	}
+
+	// 2. State after Start: IsRunning must be true
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := ms.Start(ctx); err != nil {
+		t.Fatalf("unexpected error starting MultiScheduler: %v", err)
+	}
+
+	if !ms.IsRunning() {
+		t.Errorf("expected IsRunning to be true after Start")
+	}
+
+	// 3. State after Stop: IsRunning must be false
+	ms.Stop()
+	if ms.IsRunning() {
+		t.Errorf("expected IsRunning to be false after Stop")
+	}
+}
+

@@ -370,6 +370,13 @@ func (s *MultiScheduler) ActiveRunners() int {
 	return len(s.runners)
 }
 
+// IsRunning returns true if the MultiScheduler has been started and is not stopped.
+func (s *MultiScheduler) IsRunning() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.started && !s.stopped
+}
+
 // monitorRunner manages the independent recurring fixed-delay lifecycle for a single monitor.
 // Each runner strictly owns its monitor's authoritative currentState locally on its goroutine stack.
 type monitorRunner struct {
