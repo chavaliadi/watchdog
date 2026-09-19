@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -22,6 +22,7 @@ import (
 	"github.com/chavaliadi/watchdog/internal/retry"
 	"github.com/chavaliadi/watchdog/internal/scheduler"
 	"github.com/chavaliadi/watchdog/internal/service"
+	"github.com/chavaliadi/watchdog/internal/telemetry"
 	"github.com/chavaliadi/watchdog/internal/worker"
 )
 
@@ -30,6 +31,8 @@ type Config struct {
 	DatabaseURL       string
 	WorkerConcurrency int
 	HTTPPort          string
+	LogLevel          string
+	LogFormat         string
 }
 
 const (
@@ -62,6 +65,8 @@ func loadConfig() (Config, error) {
 		DatabaseURL:       dbURL,
 		WorkerConcurrency: concurrency,
 		HTTPPort:          httpPort,
+		LogLevel:          os.Getenv("WATCHDOG_LOG_LEVEL"),
+		LogFormat:         os.Getenv("WATCHDOG_LOG_FORMAT"),
 	}, nil
 }
 
@@ -70,7 +75,7 @@ func main() {
 	defer stop()
 
 	if err := run(ctx); err != nil {
-		log.Printf("fatal error: %v", err)
+		slog.Error("fatal error", telemetry.AttrComponent, "main", telemetry.AttrError, err)
 		os.Exit(1)
 	}
 }
@@ -81,7 +86,12 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("configuration error: %w", err)
 	}
 
-	log.Println("deployment-watchdog starting...")
+	telemetry.Setup(telemetry.Config{
+		Level:  cfg.LogLevel,
+		Format: cfg.LogFormat,
+	})
+
+	slog.Info("deployment-watchdog starting", telemetry.AttrComponent, "main")
 
 	db, err := sql.Open("pgx", cfg.DatabaseURL)
 	if err != nil {
@@ -89,7 +99,7 @@ func run(ctx context.Context) error {
 	}
 	defer func() {
 		if closeErr := db.Close(); closeErr != nil {
-			log.Printf("error closing database: %v", closeErr)
+			slog.Error("error closing database", telemetry.AttrComponent, "main", telemetry.AttrError, closeErr)
 		}
 	}()
 
@@ -98,7 +108,7 @@ func run(ctx context.Context) error {
 	if err := db.PingContext(pingCtx); err != nil {
 		return fmt.Errorf("database ping failed: %w", err)
 	}
-	log.Println("database connection established")
+	slog.Info("database connection established", telemetry.AttrComponent, "main")
 
 	var repo persistence.Repository = postgres.New(db)
 	orch := scheduler.NewOrchestrator(nil, nil, retry.Config{}, repo)
@@ -124,7 +134,11 @@ func run(ctx context.Context) error {
 	handlers := api.NewHandlers(monitorSvc)
 	apiServer := api.NewServer(api.Config{Addr: cfg.HTTPPort}, handlers)
 
-	log.Printf("deployment-watchdog running (concurrency=%d, http_port=%s)...", cfg.WorkerConcurrency, cfg.HTTPPort)
+	slog.Info("deployment-watchdog running",
+		telemetry.AttrComponent, "main",
+		"concurrency", cfg.WorkerConcurrency,
+		"http_port", cfg.HTTPPort,
+	)
 	return execute(ctx, multiSched, apiServer)
 }
 
@@ -144,11 +158,11 @@ func execute(ctx context.Context, multiSched *scheduler.MultiScheduler, apiServe
 	var runErr error
 	select {
 	case <-ctx.Done():
-		log.Println("shutdown signal received, initiating graceful shutdown...")
+		slog.Info("shutdown signal received, initiating graceful shutdown", telemetry.AttrComponent, "main")
 	case err := <-serverErr:
 		if err != nil {
 			runErr = fmt.Errorf("http server error: %w", err)
-			log.Printf("http server error: %v, initiating shutdown...", err)
+			slog.Error("http server error, initiating shutdown", telemetry.AttrComponent, "main", telemetry.AttrError, err)
 		}
 	}
 
@@ -156,7 +170,7 @@ func execute(ctx context.Context, multiSched *scheduler.MultiScheduler, apiServe
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	if err := apiServer.Shutdown(shutdownCtx); err != nil {
-		log.Printf("error during http server shutdown: %v", err)
+		slog.Error("error during http server shutdown", telemetry.AttrComponent, "main", telemetry.AttrError, err)
 	}
 
 	// 2. Stop MultiScheduler runners and wait
@@ -167,6 +181,6 @@ func execute(ctx context.Context, multiSched *scheduler.MultiScheduler, apiServe
 		return runErr
 	}
 
-	log.Println("deployment-watchdog completed successfully")
+	slog.Info("deployment-watchdog completed successfully", telemetry.AttrComponent, "main")
 	return nil
 }

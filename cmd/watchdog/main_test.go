@@ -175,6 +175,23 @@ func TestLoadConfig_CustomWorkerConcurrency(t *testing.T) {
 	}
 }
 
+func TestLoadConfig_LoggingConfig(t *testing.T) {
+	t.Setenv("WATCHDOG_DATABASE_URL", "postgres://user:pass@localhost:5432/watchdog_db")
+	t.Setenv("WATCHDOG_LOG_LEVEL", "DEBUG")
+	t.Setenv("WATCHDOG_LOG_FORMAT", "json")
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.LogLevel != "DEBUG" {
+		t.Errorf("expected LogLevel DEBUG, got %q", cfg.LogLevel)
+	}
+	if cfg.LogFormat != "json" {
+		t.Errorf("expected LogFormat json, got %q", cfg.LogFormat)
+	}
+}
+
 func TestRun_DatabaseErrorsPropagate(t *testing.T) {
 	t.Setenv("WATCHDOG_DATABASE_URL", "postgres://user:pass@127.0.0.1:1/nonexistent?sslmode=disable&connect_timeout=1")
 
