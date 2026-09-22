@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +18,7 @@ import (
 	"github.com/chavaliadi/watchdog/internal/scheduler"
 	"github.com/chavaliadi/watchdog/internal/service"
 	"github.com/chavaliadi/watchdog/internal/state"
+	"github.com/chavaliadi/watchdog/internal/telemetry"
 	"github.com/chavaliadi/watchdog/internal/worker"
 )
 
@@ -521,6 +524,52 @@ func TestExecute_DrainingOnShutdown(t *testing.T) {
 
 	if !drainTracker.IsDraining() {
 		t.Errorf("expected drainTracker to be true after shutdown initiation")
+	}
+}
+
+func TestExecute_MetricsIntegration(t *testing.T) {
+	repo := &mockAppRepo{
+		listMonitorsFn: func(ctx context.Context) ([]monitor.Monitor, error) {
+			return []monitor.Monitor{}, nil
+		},
+	}
+	orch := scheduler.NewOrchestrator(nil, nil, retry.Config{}, repo)
+	pool, err := worker.NewPool(worker.Config{MaxConcurrency: 4}, orch)
+	if err != nil {
+		t.Fatalf("create pool: %v", err)
+	}
+
+	multiSched, err := scheduler.NewMultiScheduler(repo, pool)
+	if err != nil {
+		t.Fatalf("create scheduler: %v", err)
+	}
+
+	metrics := telemetry.NewMetrics()
+	metrics.RegisterWorkerPool(pool)
+
+	svc := service.NewMonitorService(repo, multiSched)
+	drainTracker := &api.DrainTracker{}
+	handlers := api.NewHandlers(
+		svc,
+		api.WithHealthChecks(nil, multiSched, drainTracker),
+		api.WithMetrics(metrics.Handler()),
+	)
+	server := api.NewServer(api.Config{Addr: "127.0.0.1:0"}, handlers)
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rr := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected /metrics to return 200, got %d", rr.Code)
+	}
+
+	body := rr.Body.String()
+	if !strings.Contains(body, "watchdog_worker_pool_capacity 4") {
+		t.Errorf("expected body to contain capacity 4, got:\n%s", body)
+	}
+	if !strings.Contains(body, "watchdog_worker_pool_active_workers 0") {
+		t.Errorf("expected body to contain active_workers 0, got:\n%s", body)
 	}
 }
 

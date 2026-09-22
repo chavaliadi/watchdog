@@ -130,11 +130,15 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("create multi-scheduler: %w", err)
 	}
 
+	metrics := telemetry.NewMetrics()
+	metrics.RegisterWorkerPool(pool)
+
 	monitorSvc := service.NewMonitorService(repo, multiSched)
 	drainTracker := &api.DrainTracker{}
 	handlers := api.NewHandlers(
 		monitorSvc,
 		api.WithHealthChecks(db, multiSched, drainTracker),
+		api.WithMetrics(metrics.Handler()),
 	)
 	apiServer := api.NewServer(api.Config{Addr: cfg.HTTPPort}, handlers)
 

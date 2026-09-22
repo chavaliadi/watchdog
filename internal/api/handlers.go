@@ -10,10 +10,11 @@ import (
 )
 
 type Handlers struct {
-	svc          *service.MonitorService
-	dbChecker    DBHealthChecker
-	schedChecker SchedulerHealthChecker
-	drainChecker DrainChecker
+	svc            *service.MonitorService
+	dbChecker      DBHealthChecker
+	schedChecker   SchedulerHealthChecker
+	drainChecker   DrainChecker
+	metricsHandler http.Handler
 }
 
 // HandlerOption configures optional dependencies on Handlers.
@@ -25,6 +26,13 @@ func WithHealthChecks(db DBHealthChecker, sched SchedulerHealthChecker, drain Dr
 		h.dbChecker = db
 		h.schedChecker = sched
 		h.drainChecker = drain
+	}
+}
+
+// WithMetrics configures the Prometheus metrics exposition handler.
+func WithMetrics(metricsHandler http.Handler) HandlerOption {
+	return func(h *Handlers) {
+		h.metricsHandler = metricsHandler
 	}
 }
 
@@ -176,4 +184,15 @@ func (h *Handlers) GetMonitorChecks(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// Metrics handles GET /metrics requests.
+// It serves Prometheus metrics exposition if configured via WithMetrics,
+// or returns 404 Not Found if no metrics handler has been registered.
+func (h *Handlers) Metrics(w http.ResponseWriter, r *http.Request) {
+	if h.metricsHandler == nil {
+		http.NotFound(w, r)
+		return
+	}
+	h.metricsHandler.ServeHTTP(w, r)
 }

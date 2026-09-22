@@ -230,6 +230,11 @@ func (p *Pool) PendingCount() int {
 	return int(atomic.LoadInt64(&p.pendingCount))
 }
 
+// Capacity returns the maximum configured worker concurrency.
+func (p *Pool) Capacity() int {
+	return p.cfg.MaxConcurrency
+}
+
 func (p *Pool) workerLoop(workerID int) {
 	defer p.workersWg.Done()
 

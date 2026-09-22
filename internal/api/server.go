@@ -30,6 +30,7 @@ func NewServer(cfg Config, handlers *Handlers) *Server {
 	mux.HandleFunc("GET /monitors/{id}/checks", handlers.GetMonitorChecks)
 	mux.HandleFunc("GET /livez", handlers.Livez)
 	mux.HandleFunc("GET /readyz", handlers.Readyz)
+	mux.HandleFunc("GET /metrics", handlers.Metrics)
 
 	readTimeout := cfg.ReadTimeout
 	if readTimeout <= 0 {
