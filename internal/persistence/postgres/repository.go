@@ -12,6 +12,7 @@ import (
 	"github.com/chavaliadi/watchdog/internal/monitor"
 	"github.com/chavaliadi/watchdog/internal/persistence"
 	"github.com/chavaliadi/watchdog/internal/state"
+	"github.com/chavaliadi/watchdog/internal/telemetry"
 )
 
 // Ensure Repository implements persistence.Repository.
@@ -20,13 +21,49 @@ var _ persistence.Repository = (*Repository)(nil)
 // Repository implements persistence.Repository using standard library database/sql
 // against a PostgreSQL database.
 type Repository struct {
-	db *sql.DB
+	db       *sql.DB
+	recorder telemetry.Recorder
+}
+
+// Option configures Repository instances.
+type Option func(*Repository)
+
+// WithRecorder configures the telemetry recorder used by the repository.
+func WithRecorder(rec telemetry.Recorder) Option {
+	return func(r *Repository) {
+		if rec != nil {
+			r.recorder = rec
+		}
+	}
 }
 
 // New constructs a PostgreSQL-backed repository using the provided *sql.DB.
 // The caller owns lifecycle management (opening, connection pooling, and closing) of db.
-func New(db *sql.DB) *Repository {
-	return &Repository{db: db}
+func New(db *sql.DB, opts ...Option) *Repository {
+	r := &Repository{
+		db:       db,
+		recorder: telemetry.NoopRecorder{},
+	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
+}
+
+// WithRecorder sets the recorder on an existing Repository and returns it for chaining.
+func (r *Repository) WithRecorder(rec telemetry.Recorder) *Repository {
+	if rec != nil {
+		r.recorder = rec
+	} else {
+		r.recorder = telemetry.NoopRecorder{}
+	}
+	return r
+}
+
+func (r *Repository) recordDB(op string, ok bool, d time.Duration) {
+	if r != nil && r.recorder != nil {
+		r.recorder.RecordDBOperation(op, ok, d)
+	}
 }
 
 const selectMonitorColumns = `
@@ -94,14 +131,19 @@ func scanMonitor(s scanner) (monitor.Monitor, error) {
 
 // GetMonitor retrieves an individual monitor configuration by ID from the monitors table.
 // If the monitor row does not exist, sql.ErrNoRows is wrapped and returned.
-func (r *Repository) GetMonitor(ctx context.Context, id string) (monitor.Monitor, error) {
+func (r *Repository) GetMonitor(ctx context.Context, id string) (m monitor.Monitor, err error) {
+	start := time.Now()
+	defer func() {
+		r.recordDB("get_monitor", err == nil, time.Since(start))
+	}()
+
 	query := `
 		SELECT ` + selectMonitorColumns + `
 		FROM monitors
 		WHERE id = $1
 	`
 
-	m, err := scanMonitor(r.db.QueryRowContext(ctx, query, id))
+	m, err = scanMonitor(r.db.QueryRowContext(ctx, query, id))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return monitor.Monitor{}, fmt.Errorf("get monitor %q: %w", id, sql.ErrNoRows)
@@ -114,7 +156,12 @@ func (r *Repository) GetMonitor(ctx context.Context, id string) (monitor.Monitor
 
 // ListMonitors retrieves all monitor configurations ordered deterministically by creation time and ID.
 // It returns an empty slice if no monitors exist.
-func (r *Repository) ListMonitors(ctx context.Context) ([]monitor.Monitor, error) {
+func (r *Repository) ListMonitors(ctx context.Context) (monitors []monitor.Monitor, err error) {
+	start := time.Now()
+	defer func() {
+		r.recordDB("list_monitors", err == nil, time.Since(start))
+	}()
+
 	query := `
 		SELECT ` + selectMonitorColumns + `
 		FROM monitors
@@ -127,7 +174,7 @@ func (r *Repository) ListMonitors(ctx context.Context) ([]monitor.Monitor, error
 	}
 	defer rows.Close()
 
-	monitors := make([]monitor.Monitor, 0)
+	monitors = make([]monitor.Monitor, 0)
 	for rows.Next() {
 		m, err := scanMonitor(rows)
 		if err != nil {
@@ -142,10 +189,7 @@ func (r *Repository) ListMonitors(ctx context.Context) ([]monitor.Monitor, error
 	return monitors, nil
 }
 
-// GetStateWithTimestamp retrieves the current health state and last update time of a monitor from monitor_states.
-// If no state row exists, sql.ErrNoRows is wrapped and returned.
-// If the database contains an invalid/unrecognized state string, an error is returned.
-func (r *Repository) GetStateWithTimestamp(ctx context.Context, monitorID string) (state.State, time.Time, error) {
+func (r *Repository) getStateWithTimestamp(ctx context.Context, monitorID string) (state.State, time.Time, error) {
 	const query = `
 		SELECT state, updated_at
 		FROM monitor_states
@@ -173,16 +217,38 @@ func (r *Repository) GetStateWithTimestamp(ctx context.Context, monitorID string
 	}
 }
 
+// GetStateWithTimestamp retrieves the current health state and last update time of a monitor from monitor_states.
+// If no state row exists, sql.ErrNoRows is wrapped and returned.
+// If the database contains an invalid/unrecognized state string, an error is returned.
+func (r *Repository) GetStateWithTimestamp(ctx context.Context, monitorID string) (st state.State, updatedAt time.Time, err error) {
+	start := time.Now()
+	defer func() {
+		r.recordDB("get_state_with_timestamp", err == nil, time.Since(start))
+	}()
+
+	return r.getStateWithTimestamp(ctx, monitorID)
+}
+
 // GetState retrieves the current health state of a monitor from monitor_states.
-func (r *Repository) GetState(ctx context.Context, monitorID string) (state.State, error) {
-	st, _, err := r.GetStateWithTimestamp(ctx, monitorID)
+func (r *Repository) GetState(ctx context.Context, monitorID string) (st state.State, err error) {
+	start := time.Now()
+	defer func() {
+		r.recordDB("get_state", err == nil, time.Since(start))
+	}()
+
+	st, _, err = r.getStateWithTimestamp(ctx, monitorID)
 	return st, err
 }
 
 // CreateMonitor creates a new monitor and its initial UNKNOWN health state atomically.
 // If either insert fails, the transaction is rolled back so that callers never observe
 // an orphaned monitor without its corresponding current state.
-func (r *Repository) CreateMonitor(ctx context.Context, m monitor.Monitor) error {
+func (r *Repository) CreateMonitor(ctx context.Context, m monitor.Monitor) (err error) {
+	start := time.Now()
+	defer func() {
+		r.recordDB("create_monitor", err == nil, time.Since(start))
+	}()
+
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin transaction for create monitor %q: %w", m.ID, err)
@@ -285,7 +351,12 @@ func (r *Repository) SaveCycle(
 	monitorID string,
 	result checker.CheckResult,
 	nextState state.State,
-) error {
+) (err error) {
+	start := time.Now()
+	defer func() {
+		r.recordDB("save_cycle", err == nil, time.Since(start))
+	}()
+
 	switch nextState {
 	case state.StateUnknown, state.StateHealthy, state.StateUnhealthy:
 	default:
@@ -385,7 +456,12 @@ func (r *Repository) SaveCycle(
 
 // UpdateMonitor updates an existing monitor's configuration.
 // If the monitor does not exist, sql.ErrNoRows is wrapped and returned.
-func (r *Repository) UpdateMonitor(ctx context.Context, m monitor.Monitor) error {
+func (r *Repository) UpdateMonitor(ctx context.Context, m monitor.Monitor) (err error) {
+	start := time.Now()
+	defer func() {
+		r.recordDB("update_monitor", err == nil, time.Since(start))
+	}()
+
 	var method sql.NullString
 	if m.Method != "" {
 		method = sql.NullString{String: m.Method, Valid: true}
@@ -453,7 +529,12 @@ func (r *Repository) UpdateMonitor(ctx context.Context, m monitor.Monitor) error
 // DeleteMonitor deletes an existing monitor by ID.
 // Cascade rules in PostgreSQL automatically clean up associated monitor_states and check_results.
 // If the monitor does not exist, sql.ErrNoRows is wrapped and returned.
-func (r *Repository) DeleteMonitor(ctx context.Context, id string) error {
+func (r *Repository) DeleteMonitor(ctx context.Context, id string) (err error) {
+	start := time.Now()
+	defer func() {
+		r.recordDB("delete_monitor", err == nil, time.Since(start))
+	}()
+
 	const deleteQuery = `
 		DELETE FROM monitors
 		WHERE id = $1
@@ -477,7 +558,11 @@ func (r *Repository) DeleteMonitor(ctx context.Context, id string) error {
 
 // ListCheckResults returns recent check results for a given monitor ordered by checked_at DESC, id DESC.
 // If no check results exist, an empty slice is returned.
-func (r *Repository) ListCheckResults(ctx context.Context, monitorID string, limit int) ([]checker.CheckResult, error) {
+func (r *Repository) ListCheckResults(ctx context.Context, monitorID string, limit int) (results []checker.CheckResult, err error) {
+	start := time.Now()
+	defer func() {
+		r.recordDB("list_check_results", err == nil, time.Since(start))
+	}()
 	if limit <= 0 {
 		limit = 20
 	}
@@ -499,7 +584,7 @@ func (r *Repository) ListCheckResults(ctx context.Context, monitorID string, lim
 	}
 	defer rows.Close()
 
-	results := make([]checker.CheckResult, 0)
+	results = make([]checker.CheckResult, 0)
 	for rows.Next() {
 		var (
 			rawID        int64

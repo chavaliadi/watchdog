@@ -11,6 +11,7 @@ import (
 	"github.com/chavaliadi/watchdog/internal/monitor"
 	"github.com/chavaliadi/watchdog/internal/persistence"
 	"github.com/chavaliadi/watchdog/internal/state"
+	"github.com/chavaliadi/watchdog/internal/telemetry"
 )
 
 var (
@@ -25,6 +26,7 @@ var (
 )
 
 type activeRunner struct {
+	kind   monitor.Kind
 	cancel context.CancelFunc
 	done   chan struct{}
 }
@@ -32,9 +34,10 @@ type activeRunner struct {
 // MultiScheduler coordinates recurring, concurrent monitoring cycles for multiple monitors
 // using independent per-monitor scheduling loops delegated to a CycleRunner (such as *worker.Pool).
 type MultiScheduler struct {
-	repo    persistence.Repository
-	runner  CycleRunner
-	onError func(monitorID string, err error)
+	repo     persistence.Repository
+	runner   CycleRunner
+	onError  func(monitorID string, err error)
+	recorder telemetry.Recorder
 
 	mu      sync.Mutex
 	started bool
@@ -61,9 +64,43 @@ func NewMultiScheduler(repo persistence.Repository, runner CycleRunner) (*MultiS
 	return &MultiScheduler{
 		repo:     repo,
 		runner:   runner,
+		recorder: telemetry.NoopRecorder{},
 		runners:  make(map[string]*activeRunner),
 		monLocks: make(map[string]*sync.Mutex),
 	}, nil
+}
+
+// WithRecorder registers a telemetry metrics recorder on the scheduler.
+func (s *MultiScheduler) WithRecorder(r telemetry.Recorder) *MultiScheduler {
+	if r == nil {
+		r = telemetry.NoopRecorder{}
+	}
+	s.recorder = r
+	return s
+}
+
+// activeCountsLocked calculates the active runner counts by protocol kind while holding s.mu.
+func (s *MultiScheduler) activeCountsLocked() (httpCount, tcpCount int) {
+	if s.stopped {
+		return 0, 0
+	}
+	for _, ar := range s.runners {
+		switch ar.kind {
+		case monitor.KindHTTP:
+			httpCount++
+		case monitor.KindTCP:
+			tcpCount++
+		}
+	}
+	return httpCount, tcpCount
+}
+
+// emitActiveMetrics records the active monitor counts outside the scheduler mutex.
+func (s *MultiScheduler) emitActiveMetrics(httpCount, tcpCount int) {
+	if s.recorder != nil {
+		s.recorder.RecordActiveMonitors(string(monitor.KindHTTP), httpCount)
+		s.recorder.RecordActiveMonitors(string(monitor.KindTCP), tcpCount)
+	}
 }
 
 // WithErrorHandler registers a callback for observing non-fatal per-monitor operational errors.
@@ -145,6 +182,7 @@ func (s *MultiScheduler) Start(ctx context.Context) error {
 		}
 
 		s.runners[t.m.ID] = &activeRunner{
+			kind:   t.m.Kind,
 			cancel: runnerCancel,
 			done:   done,
 		}
@@ -156,7 +194,9 @@ func (s *MultiScheduler) Start(ctx context.Context) error {
 			r.run(rCtx)
 		}(runner, runnerCtx, done)
 	}
+	httpCount, tcpCount := s.activeCountsLocked()
 	s.mu.Unlock()
+	s.emitActiveMetrics(httpCount, tcpCount)
 
 	return nil
 }
@@ -171,7 +211,9 @@ func (s *MultiScheduler) stopRunner(id string) {
 		return
 	}
 	delete(s.runners, id)
+	httpCount, tcpCount := s.activeCountsLocked()
 	s.mu.Unlock()
+	s.emitActiveMetrics(httpCount, tcpCount)
 
 	ar.cancel()
 	<-ar.done
@@ -229,11 +271,14 @@ func (s *MultiScheduler) StartMonitor(ctx context.Context, m monitor.Monitor) er
 	}
 
 	s.runners[m.ID] = &activeRunner{
+		kind:   m.Kind,
 		cancel: runnerCancel,
 		done:   done,
 	}
 	s.runnersWg.Add(1)
+	httpCount, tcpCount := s.activeCountsLocked()
 	s.mu.Unlock()
+	s.emitActiveMetrics(httpCount, tcpCount)
 
 	go func() {
 		defer s.runnersWg.Done()
@@ -308,11 +353,14 @@ func (s *MultiScheduler) UpdateMonitor(ctx context.Context, m monitor.Monitor) e
 		}
 
 		s.runners[m.ID] = &activeRunner{
+			kind:   m.Kind,
 			cancel: runnerCancel,
 			done:   done,
 		}
 		s.runnersWg.Add(1)
+		httpCount, tcpCount := s.activeCountsLocked()
 		s.mu.Unlock()
+		s.emitActiveMetrics(httpCount, tcpCount)
 
 		go func() {
 			defer s.runnersWg.Done()
@@ -343,7 +391,9 @@ func (s *MultiScheduler) Stop() {
 	if s.cancel != nil {
 		s.cancel()
 	}
+	httpCount, tcpCount := s.activeCountsLocked()
 	s.mu.Unlock()
+	s.emitActiveMetrics(httpCount, tcpCount)
 }
 
 // Wait blocks until all monitor runners have completely exited.

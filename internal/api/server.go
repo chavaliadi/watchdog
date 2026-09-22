@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"time"
 )
@@ -18,18 +19,68 @@ type Server struct {
 	mux        *http.ServeMux
 }
 
+// statusResponseWriter captures HTTP status code for metrics recording
+// while preserving optional standard ResponseWriter interfaces.
+type statusResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+	written    bool
+}
+
+func (w *statusResponseWriter) WriteHeader(code int) {
+	if !w.written {
+		w.statusCode = code
+		w.written = true
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusResponseWriter) Write(b []byte) (int, error) {
+	if !w.written {
+		w.statusCode = http.StatusOK
+		w.written = true
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *statusResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *statusResponseWriter) ReadFrom(r io.Reader) (int64, error) {
+	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
+		if !w.written {
+			w.statusCode = http.StatusOK
+			w.written = true
+		}
+		return rf.ReadFrom(r)
+	}
+	return io.Copy(w.ResponseWriter, r)
+}
+
 func NewServer(cfg Config, handlers *Handlers) *Server {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("POST /monitors", handlers.CreateMonitor)
-	mux.HandleFunc("GET /monitors", handlers.ListMonitors)
-	mux.HandleFunc("GET /monitors/{id}", handlers.GetMonitor)
-	mux.HandleFunc("PATCH /monitors/{id}", handlers.PatchMonitor)
-	mux.HandleFunc("DELETE /monitors/{id}", handlers.DeleteMonitor)
-	mux.HandleFunc("GET /monitors/{id}/status", handlers.GetMonitorStatus)
-	mux.HandleFunc("GET /monitors/{id}/checks", handlers.GetMonitorChecks)
-	mux.HandleFunc("GET /livez", handlers.Livez)
-	mux.HandleFunc("GET /readyz", handlers.Readyz)
+	wrap := func(pattern string, fn http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			srw := &statusResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+			fn(srw, r)
+			handlers.recorder.RecordHTTPRequest(r.Method, pattern, srw.statusCode, time.Since(start))
+		}
+	}
+
+	mux.HandleFunc("POST /monitors", wrap("/monitors", handlers.CreateMonitor))
+	mux.HandleFunc("GET /monitors", wrap("/monitors", handlers.ListMonitors))
+	mux.HandleFunc("GET /monitors/{id}", wrap("/monitors/{id}", handlers.GetMonitor))
+	mux.HandleFunc("PATCH /monitors/{id}", wrap("/monitors/{id}", handlers.PatchMonitor))
+	mux.HandleFunc("DELETE /monitors/{id}", wrap("/monitors/{id}", handlers.DeleteMonitor))
+	mux.HandleFunc("GET /monitors/{id}/status", wrap("/monitors/{id}/status", handlers.GetMonitorStatus))
+	mux.HandleFunc("GET /monitors/{id}/checks", wrap("/monitors/{id}/checks", handlers.GetMonitorChecks))
+	mux.HandleFunc("GET /livez", wrap("/livez", handlers.Livez))
+	mux.HandleFunc("GET /readyz", wrap("/readyz", handlers.Readyz))
 	mux.HandleFunc("GET /metrics", handlers.Metrics)
 
 	readTimeout := cfg.ReadTimeout

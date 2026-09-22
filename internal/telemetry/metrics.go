@@ -19,6 +19,7 @@ type Recorder interface {
 	RecordCycleError(stage string)
 	RecordDBOperation(op string, ok bool, duration time.Duration)
 	RecordHTTPRequest(method, route string, statusCode int, duration time.Duration)
+	RecordActiveMonitors(kind string, count int)
 }
 
 // NoopRecorder is a no-op implementation of the Recorder interface.
@@ -30,6 +31,7 @@ func (NoopRecorder) RecordCycleError(stage string)                              
 func (NoopRecorder) RecordDBOperation(op string, ok bool, duration time.Duration)            {}
 func (NoopRecorder) RecordHTTPRequest(method, route string, statusCode int, duration time.Duration) {
 }
+func (NoopRecorder) RecordActiveMonitors(kind string, count int) {}
 
 var _ Recorder = NoopRecorder{}
 
@@ -247,6 +249,11 @@ func (m *Metrics) RegisterWorkerPool(p WorkerStatsProvider) {
 // SetMonitorsActive updates the watchdog_monitors_active gauge for a given protocol kind.
 func (m *Metrics) SetMonitorsActive(kind string, count float64) {
 	m.monitorsActive.WithLabelValues(normalizeKind(kind)).Set(count)
+}
+
+// RecordActiveMonitors updates the watchdog_monitors_active gauge for a given protocol kind.
+func (m *Metrics) RecordActiveMonitors(kind string, count int) {
+	m.monitorsActive.WithLabelValues(normalizeKind(kind)).Set(float64(count))
 }
 
 // RecordCheck records a completed monitoring check execution.

@@ -242,6 +242,7 @@ func TestNoopRecorder(t *testing.T) {
 	rec.RecordCycleError("run_cycle")
 	rec.RecordDBOperation("save_cycle", true, 10*time.Millisecond)
 	rec.RecordHTTPRequest("GET", "/monitors", 200, 10*time.Millisecond)
+	rec.RecordActiveMonitors("http", 5)
 }
 
 func TestMetrics_RecorderMethodsGatherValues(t *testing.T) {
@@ -253,6 +254,7 @@ func TestMetrics_RecorderMethodsGatherValues(t *testing.T) {
 	m.RecordCycleError("run_cycle")
 	m.RecordDBOperation("save_cycle", true, 5*time.Millisecond)
 	m.RecordHTTPRequest("GET", "/monitors/{id}", 200, 12*time.Millisecond)
+	m.RecordActiveMonitors("http", 3)
 
 	fams, err := m.Registry().Gather()
 	if err != nil {

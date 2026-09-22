@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	"github.com/chavaliadi/watchdog/internal/service"
+	"github.com/chavaliadi/watchdog/internal/telemetry"
 )
 
 type Handlers struct {
@@ -15,6 +16,7 @@ type Handlers struct {
 	schedChecker   SchedulerHealthChecker
 	drainChecker   DrainChecker
 	metricsHandler http.Handler
+	recorder       telemetry.Recorder
 }
 
 // HandlerOption configures optional dependencies on Handlers.
@@ -36,10 +38,23 @@ func WithMetrics(metricsHandler http.Handler) HandlerOption {
 	}
 }
 
+// WithRecorder configures the telemetry metrics recorder for Handlers.
+func WithRecorder(recorder telemetry.Recorder) HandlerOption {
+	return func(h *Handlers) {
+		h.recorder = recorder
+	}
+}
+
 func NewHandlers(svc *service.MonitorService, opts ...HandlerOption) *Handlers {
-	h := &Handlers{svc: svc}
+	h := &Handlers{
+		svc:      svc,
+		recorder: telemetry.NoopRecorder{},
+	}
 	for _, opt := range opts {
 		opt(h)
+	}
+	if h.recorder == nil {
+		h.recorder = telemetry.NoopRecorder{}
 	}
 	return h
 }

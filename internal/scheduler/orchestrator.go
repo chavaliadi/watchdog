@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/chavaliadi/watchdog/internal/checker"
 	"github.com/chavaliadi/watchdog/internal/monitor"
 	"github.com/chavaliadi/watchdog/internal/persistence"
 	"github.com/chavaliadi/watchdog/internal/retry"
 	"github.com/chavaliadi/watchdog/internal/state"
+	"github.com/chavaliadi/watchdog/internal/telemetry"
 )
 
 // CycleResult represents the outcome of one completed monitoring cycle.
@@ -24,6 +26,7 @@ type Orchestrator struct {
 	httpRetrier checker.Checker
 	tcpRetrier  checker.Checker
 	repository  persistence.Repository
+	recorder    telemetry.Recorder
 }
 
 // NewOrchestrator creates a new Orchestrator with the supplied checkers, retry configuration,
@@ -52,7 +55,17 @@ func NewOrchestrator(
 		httpRetrier: retry.New(httpChecker, retryCfg),
 		tcpRetrier:  retry.New(tcpChecker, retryCfg),
 		repository:  r,
+		recorder:    telemetry.NoopRecorder{},
 	}
+}
+
+// WithRecorder configures the telemetry metrics recorder on the Orchestrator.
+func (o *Orchestrator) WithRecorder(r telemetry.Recorder) *Orchestrator {
+	if r == nil {
+		r = telemetry.NoopRecorder{}
+	}
+	o.recorder = r
+	return o
 }
 
 // RunCycle coordinates checking, retrying, state evaluation, and optional persistence
@@ -67,15 +80,23 @@ func (o *Orchestrator) RunCycle(
 	m monitor.Monitor,
 	current state.State,
 ) (CycleResult, error) {
+	var rec telemetry.Recorder = telemetry.NoopRecorder{}
+	if o != nil && o.recorder != nil {
+		rec = o.recorder
+	}
+
 	if ctx == nil {
+		rec.RecordCycleError("run_cycle")
 		return CycleResult{}, errors.New("nil context provided to Orchestrator")
 	}
 
 	if err := ctx.Err(); err != nil {
+		rec.RecordCycleError("run_cycle")
 		return CycleResult{}, err
 	}
 
 	if o == nil || o.httpRetrier == nil || o.tcpRetrier == nil {
+		rec.RecordCycleError("run_cycle")
 		return CycleResult{}, errors.New("uninitialized Orchestrator")
 	}
 
@@ -86,21 +107,29 @@ func (o *Orchestrator) RunCycle(
 	case monitor.KindTCP:
 		retrier = o.tcpRetrier
 	default:
+		rec.RecordCycleError("run_cycle")
 		return CycleResult{}, fmt.Errorf("unsupported monitor kind %q", m.Kind)
 	}
 
+	start := time.Now()
 	checkResult, err := retrier.Check(ctx, m)
+	duration := time.Since(start)
 	if err != nil {
+		rec.RecordCycleError("run_cycle")
 		return CycleResult{}, err
 	}
 
+	rec.RecordCheck(string(m.Kind), checkResult.OK, string(checkResult.ErrorClass), duration)
+
 	transitionResult, err := state.TransitionFromCheckResult(current, checkResult)
 	if err != nil {
+		rec.RecordCycleError("run_cycle")
 		return CycleResult{}, err
 	}
 
 	if o.repository != nil {
 		if err := o.repository.SaveCycle(ctx, m.ID, checkResult, transitionResult.NextState); err != nil {
+			rec.RecordCycleError("save_cycle")
 			return CycleResult{}, fmt.Errorf("save cycle for monitor %q: %w", m.ID, err)
 		}
 	}

@@ -110,8 +110,10 @@ func run(ctx context.Context) error {
 	}
 	slog.Info("database connection established", telemetry.AttrComponent, "main")
 
-	var repo persistence.Repository = postgres.New(db)
-	orch := scheduler.NewOrchestrator(nil, nil, retry.Config{}, repo)
+	metrics := telemetry.NewMetrics()
+
+	var repo persistence.Repository = postgres.New(db, postgres.WithRecorder(metrics))
+	orch := scheduler.NewOrchestrator(nil, nil, retry.Config{Recorder: metrics}, repo).WithRecorder(metrics)
 
 	pool, err := worker.NewPool(worker.Config{
 		MaxConcurrency: cfg.WorkerConcurrency,
@@ -125,13 +127,13 @@ func run(ctx context.Context) error {
 		pool.Wait()
 	}()
 
+	metrics.RegisterWorkerPool(pool)
+
 	multiSched, err := scheduler.NewMultiScheduler(repo, pool)
 	if err != nil {
 		return fmt.Errorf("create multi-scheduler: %w", err)
 	}
-
-	metrics := telemetry.NewMetrics()
-	metrics.RegisterWorkerPool(pool)
+	multiSched.WithRecorder(metrics)
 
 	monitorSvc := service.NewMonitorService(repo, multiSched)
 	drainTracker := &api.DrainTracker{}
@@ -139,6 +141,7 @@ func run(ctx context.Context) error {
 		monitorSvc,
 		api.WithHealthChecks(db, multiSched, drainTracker),
 		api.WithMetrics(metrics.Handler()),
+		api.WithRecorder(metrics),
 	)
 	apiServer := api.NewServer(api.Config{Addr: cfg.HTTPPort}, handlers)
 

@@ -8,6 +8,7 @@ import (
 
 	"github.com/chavaliadi/watchdog/internal/checker"
 	"github.com/chavaliadi/watchdog/internal/monitor"
+	"github.com/chavaliadi/watchdog/internal/telemetry"
 )
 
 // Default Phase 1 implementation parameters.
@@ -30,6 +31,7 @@ type Config struct {
 	MaxDelay    time.Duration
 	Sleeper     Sleeper
 	JitterFn    JitterFn
+	Recorder    telemetry.Recorder
 }
 
 // Retrier wraps a checker.Checker with exponential backoff and jitter.
@@ -40,6 +42,7 @@ type Retrier struct {
 	maxDelay    time.Duration
 	sleeper     Sleeper
 	jitterFn    JitterFn
+	recorder    telemetry.Recorder
 }
 
 // Ensure Retrier satisfies the Checker interface at compile time.
@@ -73,6 +76,11 @@ func New(c checker.Checker, cfg Config) *Retrier {
 		jitterFn = defaultJitter
 	}
 
+	rec := cfg.Recorder
+	if rec == nil {
+		rec = telemetry.NoopRecorder{}
+	}
+
 	return &Retrier{
 		checker:     c,
 		maxAttempts: maxAttempts,
@@ -80,6 +88,7 @@ func New(c checker.Checker, cfg Config) *Retrier {
 		maxDelay:    maxDelay,
 		sleeper:     sleeper,
 		jitterFn:    jitterFn,
+		recorder:    rec,
 	}
 }
 
@@ -111,11 +120,17 @@ func (r *Retrier) Check(ctx context.Context, m monitor.Monitor) (checker.CheckRe
 
 		// If the check was successful, return immediately.
 		if res.OK {
+			if attempt > 1 {
+				r.recorder.RecordRetry(string(m.Kind), "recovered")
+			}
 			return res, nil
 		}
 
 		// If this was the last attempt, do not back off; return the failed result.
 		if attempt == r.maxAttempts {
+			if attempt > 1 {
+				r.recorder.RecordRetry(string(m.Kind), "exhausted")
+			}
 			break
 		}
 
