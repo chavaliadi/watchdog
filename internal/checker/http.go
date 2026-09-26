@@ -50,7 +50,14 @@ func (c *HTTPChecker) Check(ctx context.Context, m monitor.Monitor) (CheckResult
 		return CheckResult{}, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, strings.ToUpper(strings.TrimSpace(m.Method)), m.TargetURL, nil)
+	checkCtx := ctx
+	if m.Timeout > 0 {
+		var cancel context.CancelFunc
+		checkCtx, cancel = context.WithTimeout(ctx, m.Timeout)
+		defer cancel()
+	}
+
+	req, err := http.NewRequestWithContext(checkCtx, strings.ToUpper(strings.TrimSpace(m.Method)), m.TargetURL, nil)
 	if err != nil {
 		return CheckResult{}, fmt.Errorf("failed to create HTTP request: %w", err)
 	}
@@ -65,7 +72,7 @@ func (c *HTTPChecker) Check(ctx context.Context, m monitor.Monitor) (CheckResult
 			CheckedAt:    start.UTC(),
 			OK:           false,
 			Latency:      latency,
-			ErrorClass:   classifyNetworkError(ctx, doErr),
+			ErrorClass:   classifyNetworkError(checkCtx, doErr),
 			ErrorDetail:  doErr.Error(),
 			AttemptCount: 1,
 		}, nil

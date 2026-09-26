@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -498,4 +499,27 @@ func TestAPI_StatusAndChecks(t *testing.T) {
 			t.Errorf("unexpected check result: %+v", checks[0])
 		}
 	})
+}
+
+func TestAPI_OversizedRequestBodyRejected(t *testing.T) {
+	ts, _, _ := setupAPITestServer(t)
+	defer ts.Close()
+
+	// Send an oversized body (> 1MB)
+	oversizedBody := strings.Repeat("x", 2*1024*1024)
+	resp, err := http.Post(ts.URL+"/monitors", "application/json", strings.NewReader(oversizedBody))
+	if err != nil {
+		t.Fatalf("POST failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for oversized body, got %d", resp.StatusCode)
+	}
+
+	var errResp api.ErrorEnvelope
+	_ = json.NewDecoder(resp.Body).Decode(&errResp)
+	if errResp.Error.Code != "MALFORMED_JSON" {
+		t.Errorf("expected error code MALFORMED_JSON, got %q", errResp.Error.Code)
+	}
 }

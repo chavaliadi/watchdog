@@ -46,8 +46,15 @@ func (c *TCPChecker) Check(ctx context.Context, m monitor.Monitor) (CheckResult,
 		return CheckResult{}, err
 	}
 
+	checkCtx := ctx
+	if m.Timeout > 0 {
+		var cancel context.CancelFunc
+		checkCtx, cancel = context.WithTimeout(ctx, m.Timeout)
+		defer cancel()
+	}
+
 	start := time.Now()
-	conn, dialErr := c.dialer.DialContext(ctx, "tcp", targetAddr)
+	conn, dialErr := c.dialer.DialContext(checkCtx, "tcp", targetAddr)
 	latency := time.Since(start)
 
 	if dialErr != nil {
@@ -56,7 +63,7 @@ func (c *TCPChecker) Check(ctx context.Context, m monitor.Monitor) (CheckResult,
 			CheckedAt:    start.UTC(),
 			OK:           false,
 			Latency:      latency,
-			ErrorClass:   classifyNetworkError(ctx, dialErr),
+			ErrorClass:   classifyNetworkError(checkCtx, dialErr),
 			ErrorDetail:  dialErr.Error(),
 			AttemptCount: 1,
 		}, nil

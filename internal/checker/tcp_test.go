@@ -511,3 +511,41 @@ func TestTCPChecker_NetworkErrorClassifications(t *testing.T) {
 		})
 	}
 }
+
+func TestTCPChecker_EnforcesMonitorTimeout(t *testing.T) {
+	mock := &mockDialer{
+		dialFunc: func(ctx context.Context, network, address string) (net.Conn, error) {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(300 * time.Millisecond):
+				return nil, errors.New("unexpected delay completion")
+			}
+		},
+	}
+
+	c := NewTCPChecker(mock)
+	m := monitor.Monitor{
+		ID:        "mon-tcp-timeout-enforce",
+		Kind:      monitor.KindTCP,
+		TargetURL: "127.0.0.1:8080",
+		Timeout:   50 * time.Millisecond,
+	}
+
+	start := time.Now()
+	res, err := c.Check(context.Background(), m)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("expected nil Go error, got: %v", err)
+	}
+	if res.OK {
+		t.Errorf("expected res.OK to be false")
+	}
+	if res.ErrorClass != ErrorClassTimeout {
+		t.Errorf("expected ErrorClassTimeout, got %q", res.ErrorClass)
+	}
+	if elapsed >= 250*time.Millisecond {
+		t.Errorf("expected dial to be canceled around 50ms, took %v", elapsed)
+	}
+}

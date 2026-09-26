@@ -457,3 +457,39 @@ func TestHTTPChecker_ExpectedStatusRanges(t *testing.T) {
 		})
 	}
 }
+
+func TestHTTPChecker_EnforcesMonitorTimeout(t *testing.T) {
+	// A target server that blocks longer than the monitor's configured timeout.
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	c := NewHTTPChecker(ts.Client())
+	m := monitor.Monitor{
+		ID:                  "mon-timeout-enforce",
+		Kind:                monitor.KindHTTP,
+		TargetURL:           ts.URL,
+		Method:              "GET",
+		ExpectedStatusRange: "200",
+		Timeout:             50 * time.Millisecond,
+	}
+
+	start := time.Now()
+	res, err := c.Check(context.Background(), m)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("expected nil system error, got: %v", err)
+	}
+	if res.OK {
+		t.Errorf("expected res.OK to be false on timeout")
+	}
+	if res.ErrorClass != ErrorClassTimeout {
+		t.Errorf("expected ErrorClassTimeout, got %q", res.ErrorClass)
+	}
+	if elapsed >= 250*time.Millisecond {
+		t.Errorf("expected check to be canceled around 50ms, took %v", elapsed)
+	}
+}

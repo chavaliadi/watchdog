@@ -62,6 +62,7 @@ func NewHandlers(svc *service.MonitorService, opts ...HandlerOption) *Handlers {
 // CreateMonitor handles POST /monitors
 func (h *Handlers) CreateMonitor(w http.ResponseWriter, r *http.Request) {
 	var body CreateMonitorJSON
+	r.Body = http.MaxBytesReader(w, r.Body, 1024*1024)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&body); err != nil {
@@ -123,6 +124,7 @@ func (h *Handlers) PatchMonitor(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
 	var body PatchMonitorJSON
+	r.Body = http.MaxBytesReader(w, r.Body, 1024*1024)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&body); err != nil {
