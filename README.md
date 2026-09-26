@@ -14,8 +14,8 @@ Modern software deployments frequently suffer from silent outages: portfolio sit
 
 ## Current Status
 
-* **Phase 1–6 Complete**: Core engine, PostgreSQL persistence, application runtime, bounded worker pool scheduling, REST API lifecycle management, and React management dashboard are fully implemented and verified.
-* **Next Phase**: **Phase 7 — Observability** (structured logging, metrics, health/readiness, and instrumentation).
+* **Phase 1–7 Complete**: Core engine, PostgreSQL persistence, application runtime, bounded worker pool scheduling, REST API lifecycle management, React management dashboard, and runtime observability (structured logging, Prometheus metrics, health/readiness probes, and subsystem instrumentation) are fully implemented and verified.
+* **Next Phase**: **Phase 8 — Docker / Containerization**.
 
 ---
 
@@ -33,7 +33,9 @@ Modern software deployments frequently suffer from silent outages: portfolio sit
 * **REST API**: Built with Go's standard library `net/http` pattern matching, offering structured JSON error envelopes and status mapping.
 * **React Management Dashboard**: Vite + React 19 + TypeScript SPA with live health summary cards, responsive tabular views, inline controls, and check history inspection.
 * **Dynamic Polling**: Automatic UI synchronization that adapts to each monitor's configured interval while pausing background network activity when tabs are hidden.
-* **Graceful Shutdown**: Intercepts `SIGINT` / `SIGTERM` signals to gracefully drain in-flight work, stop scheduler runners, and shut down the HTTP server.
+* **Structured Logging**: Built-in Go standard library `log/slog` logging with configurable levels (`DEBUG`, `INFO`, `WARN`, `ERROR`), output formats (`text`, `json`), and context correlation (`req_id`, `cycle_id`).
+* **Health & Readiness Probes**: Shallow deterministic liveness check (`GET /livez`) and deep dependency-aware readiness check (`GET /readyz`) with graceful shutdown draining.
+* **Prometheus Metrics**: Isolated application registry exposing runtime metrics (`GET /metrics`) covering checks, retries, cycle errors, HTTP API calls, DB operations, active monitors, and worker pool queue dynamics with strict bounded label cardinality.
 * **Race & Concurrency Safe**: Verified with the Go race detector (`go test -race ./...`).
 
 ---
@@ -96,6 +98,7 @@ flowchart TD
 * **Language**: Go 1.26.5
 * **HTTP Routing & Server**: Go Standard Library `net/http` (Go 1.22+ ServeMux routing)
 * **Database Driver**: `github.com/jackc/pgx/v5` (`stdlib`)
+* **Observability & Metrics**: Go Standard Library `log/slog`, `github.com/prometheus/client_golang` (isolated application registry)
 * **Standard Concurrency**: Go channels, `sync.Mutex`, `sync.WaitGroup`, `context.Context`
 
 ### Database
@@ -263,6 +266,9 @@ All API routes are rooted at `/`:
 | `DELETE` | `/monitors/{id}` | Stop runner and delete monitor from database | `204 No Content` |
 | `GET` | `/monitors/{id}/status` | Retrieve current health state and timestamp | `200 OK` |
 | `GET` | `/monitors/{id}/checks` | Get recent check results history (`?limit=N`, max 100) | `200 OK` |
+| `GET` | `/livez` | Shallow liveness probe (returns 200 when alive) | `200 OK` |
+| `GET` | `/readyz` | Deep readiness probe (checks draining state, scheduler running, and PostgreSQL ping) | `200 OK` / `503 Service Unavailable` |
+| `GET` | `/metrics` | Prometheus metrics exposition in text format (version=0.0.4) | `200 OK` |
 
 ### Error Format
 All errors return a standard JSON envelope:
@@ -330,6 +336,8 @@ Set the database connection string and start the Go server:
 export WATCHDOG_DATABASE_URL="postgres://localhost:5432/watchdog?sslmode=disable"
 export WATCHDOG_HTTP_PORT=":8080"
 export WATCHDOG_WORKER_CONCURRENCY=5
+export WATCHDOG_LOG_LEVEL="INFO"        # DEBUG, INFO, WARN, ERROR
+export WATCHDOG_LOG_FORMAT="text"       # text, json
 
 # Start backend
 go run ./cmd/watchdog
@@ -386,7 +394,7 @@ npm run build
 ## Design Guarantees & Engineering Decisions
 
 * **No Web Framework**: The backend relies purely on Go's standard library `net/http`, avoiding framework lock-in and minimizing external dependencies.
-* **Single Dependency on Backend**: Only `github.com/jackc/pgx/v5` is imported for PostgreSQL interaction.
+* **Minimal External Dependencies**: Only `github.com/jackc/pgx/v5` for PostgreSQL and `github.com/prometheus/client_golang` for Prometheus metrics exposition are used.
 * **No Overlapping Checks**: Each monitor runner awaits the completion of its prior cycle plus interval delay before triggering the next cycle.
 * **Bounded Concurrency**: Global worker pools enforce strict concurrency ceilings regardless of how many monitors are active.
 * **Transactional State Updates**: Database transactions prevent partial states (e.g. check result stored without updating current health status).
@@ -401,7 +409,6 @@ npm run build
 * **Authentication & Authorization**: The REST API and dashboard are currently unauthenticated (designed for internal infrastructure networks).
 * **Dashboard N+1 Status Requests**: The dashboard fetches the monitor list followed by concurrent status queries per monitor. Acceptable for current scope, documented for future optimization via SQL join.
 * **Polling-Based Updates**: Real-time streaming via WebSockets or Server-Sent Events is not yet supported.
-* **Observability Features Pending**: Structured logging, metrics, health/readiness, and instrumentation are planned for Phase 7.
 
 ---
 
@@ -413,8 +420,8 @@ npm run build
 * **Phase 4** — Scheduler + worker pool + multi-monitor execution ✅
 * **Phase 5** — REST API + runtime lifecycle management ✅
 * **Phase 6** — React management dashboard ✅
-* **Phase 7 — Observability** 🚧 *NEXT*
-* **Phase 8 — Docker / Containerization** 📋
+* **Phase 7 — Observability** ✅
+* **Phase 8 — Docker / Containerization** 🚧 *NEXT*
 * **Phase 9 — CI/CD** 📋
 * **Phase 10 — AWS + Terraform** 📋
 * **Phase 11 — Production Hardening** 📋
