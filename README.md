@@ -32,10 +32,10 @@ Modern software deployments frequently suffer from silent outages: portfolio sit
   * **Phase 7D**: Subsystem instrumentation (scheduler, worker pool, checker, retry, API, DB)
   * **Phase 7E**: End-to-end observability verification
   * **Production Hardening**: Production hardening audit and concrete P1 fixes (probe timeout enforcement, request-body limits, and regression suites)
-* **Next Engineering Stage**: **Performance & Load Testing** (establishing an empirical baseline before further optimization).
+  * **Phase 8**: Performance & load testing (empirical baselines established across all 11 performance surfaces, independently audited benchmark suite isolated under `test/benchmark/`)
+* **Next Engineering Stage**: **CI/CD** (Automating testing, race detection, linting, and build verification).
 * **Deferred / Not Yet Implemented**:
   * Docker / containerization is **not** implemented.
-  * CI/CD pipelines are **not** implemented.
   * AWS / Terraform production deployment is **not** implemented.
 
 ---
@@ -413,6 +413,63 @@ A production hardening audit identified two P1 failure modes that have been reso
 
 ---
 
+## Performance & Scale
+
+The system's empirical performance baselines were established during Phase 8 using an isolated, independently audited benchmark suite (`test/benchmark/`) operating against local deterministic infrastructure and an ephemeral PostgreSQL 17 instance.
+
+### Tested Workload Envelope
+* **Monitors Tested**: Up to 500 active monitors.
+* **Worker Concurrency Tested**: Evaluated across 1, 5, 10, 25, and 50 workers.
+* **No P0/P1 Bottlenecks**: No correctness failures, data corruption, or system halts were observed within the tested workload and scale envelope.
+
+### Measured Benchmark Baselines
+
+* **HTTP Checker**:
+  * Fast 200 OK response: approximately 60 µs average latency (~37–60 µs range).
+  * Failed 500 status response: approximately 42 µs average latency.
+  * Fast-path throughput: roughly 16,000+ ops/s in the tested workload.
+  * Timeout enforcement: a 40 ms monitor timeout against a 200 ms slow target was enforced at approximately 40.5 ms with `ErrorClass: timeout`.
+* **TCP Checker**:
+  * Successful connection: approximately 70 µs average latency.
+  * Refused connection: approximately 25 µs average latency (`ErrorClass: conn_refused`).
+  * Timeout enforcement: a 40 ms monitor timeout was enforced at approximately 41 ms.
+* **Retry Layer**:
+  * First-attempt success overhead: approximately 44 ns per invocation with 0 allocations in the measured path.
+  * Three-attempt failure and context cancellation during backoff were verified to abort cleanly.
+* **Worker Pool Concurrency & Throughput**:
+  * Concurrency scaling (under tested 2 ms simulated work):
+    * 1 worker: approximately 437 jobs/s (571 ms average latency)
+    * 5 workers: approximately 2,174 jobs/s (111 ms average latency)
+    * 10 workers: approximately 4,382 jobs/s (57 ms average latency)
+    * 25 workers: approximately 11,217 jobs/s (23 ms average latency)
+    * 50 workers: approximately 22,199 jobs/s (11 ms average latency)
+  * Same-monitor serialization: verified that concurrent submissions for the same monitor ID maintain a peak concurrency of strictly 1.
+  * Multi-monitor concurrency: verified that submissions for distinct monitors execute in parallel.
+* **MultiScheduler Scaling**:
+  * Tested at 10, 50, 100, 250, and 500 monitors with one runner goroutine per monitor.
+  * Memory usage: at 500 monitors, benchmark memory usage was approximately 7.3 MB heap allocation.
+  * Throughput: reached roughly 3,800 cycles/s under an aggressive 50 ms test interval against a 25-worker pool. *(Note: this 50 ms interval represents an artificial stress workload, not a normal production monitor configuration).*
+* **PostgreSQL Persistence**:
+  * Sequential `SaveCycle`: approximately 142 µs average latency (~7,035 ops/s).
+  * Concurrent `SaveCycle`: throughput reached approximately 15,000 ops/s across 5–10 concurrent workers; at 50 concurrent writers, average latency was approximately 4.25 ms (p95 ~22.3 ms).
+  * Read operations: `GetState` averaged approximately 27 µs; `ListCheckResults` (limit 10) averaged approximately 56 µs.
+  * Connection pool stats: no connection-pool waiting (`WaitCount: 0`, `WaitDuration: 0s`) was observed under tested local workloads using Go's default `database/sql` configuration.
+* **REST API Endpoints**:
+  * `GET /monitors` scaling: 10 monitors (102 µs, 2.9 KB), 100 monitors (262 µs, 29.6 KB), 500 monitors (931 µs, 148 KB).
+  * Single-resource endpoints: `GET /monitors/{id}` (~137 µs), `GET /monitors/{id}/status` (~143 µs), `GET /monitors/{id}/checks` (~184 µs), `POST /monitors` (~286 µs), `PATCH /monitors/{id}` (~253 µs).
+* **Frontend N+1 Dashboard Simulation**:
+  * Tested pattern: 1 list request followed by $N$ concurrent status requests.
+  * At 500 monitors (501 HTTP requests, ~1,501 database queries), total dashboard load was approximately 269 ms on local loopback. *(Note: this is a local loopback measurement and does not represent a WAN performance guarantee; remote browser connection limits introduce latency over network hops).*
+* **Observability Overhead**:
+  * Metric recording: measured approximately 95–123 ns per invocation with zero heap allocations in the measured path (`RecordCheck` ~107–117 ns, `RecordHTTPRequest` ~123 ns, `RecordDBOperation` ~95 ns).
+  * Structured logging: `slog.Info` in JSON format measured approximately 574 ns per log line.
+  * In database persistence cycles, telemetry recording overhead accounted for less than 0.1% of total transaction duration.
+* **Resource Stability**:
+  * A 3-second scheduler sampling test under 50 monitors at 100 ms intervals showed bounded heap allocations (~1.3–1.8 MB) and goroutines returning near baseline upon graceful shutdown. No obvious resource leaks were observed in the tested workload.
+  * All 12 Prometheus metric families were verified through `/metrics`.
+
+---
+
 ## Frontend
 
 The frontend is a dedicated Single Page Application in `web/`:
@@ -515,6 +572,16 @@ go test -v -run "TestHTTPChecker_EnforcesMonitorTimeout|TestTCPChecker_EnforcesM
 go test -v -run TestAPI_OversizedRequestBodyRejected ./internal/api/...
 ```
 
+### Performance & Benchmark Suite
+Run the isolated Phase 8 benchmark suite:
+```bash
+# Run all benchmark tests and scaling assertions
+go test -v ./test/benchmark/...
+
+# Run micro-benchmarks with memory allocation profiling
+go test -bench=. -benchmem ./test/benchmark/...
+```
+
 ### Frontend Test Suite
 Run TypeScript static analysis, Vitest component/unit tests, and production asset bundling:
 ```bash
@@ -534,16 +601,17 @@ npm run build
 
 ## Current Limitations
 
-The following architectural limitations represent intentional scope boundaries or areas for future optimization:
+The following architectural limitations represent intentional scope boundaries, stress-workload observations, or areas for future optimization:
 
-* **PostgreSQL Connection-Pool Tuning**: Database connection pool parameters (max open connections, max idle connections, connection max lifetime) are currently hardcoded or use driver defaults rather than environment variable configuration.
-* **Unpaginated Monitor Listing**: `GET /monitors` returns all monitors in a single query. Cursor-based or offset-based pagination would be appropriate for higher monitor counts.
+* **PostgreSQL Connection-Pool Tuning**: Database connection pool parameters (`SetMaxOpenConns`, `SetMaxIdleConns`, `SetConnMaxLifetime`) are not currently exposed as environment variables and use driver defaults. While the benchmark suite observed zero connection-pool waiting under the tested single-instance local workloads, explicit pool limits remain relevant for multi-instance or high-concurrency production deployments.
+* **Unpaginated Monitor Listing**: `GET /monitors` currently returns the full monitor catalog. In the benchmark suite, 500 monitors yielded a 148 KB payload and 931 µs response time. Keyset or offset pagination remains a future consideration as the monitor catalog grows beyond the tested scale.
+* **Dashboard N+1 Status Requests**: The dashboard fetches the monitor list followed by concurrent status queries per monitor. At 500 monitors, the simulation generated 501 HTTP requests and approximately 1,501 SQL queries, completing in 269 ms on local loopback. However, over higher-latency WAN connections or in browsers with concurrent connection limits (typically 6 per domain on HTTP/1.1), this pattern increases round-trip latency. A future bulk-status endpoint (`GET /monitors/status`) can consolidate this into a single query.
+* **Worker Queue Under Stress Intervals**: In a benchmark stress test using an aggressive 50 ms check interval with 500 monitors, a 25-worker pool accumulated queued jobs because incoming check requests exceeded worker capacity. For normal monitor intervals (typically 60 seconds), queue accumulation was not observed.
 * **Fixed HTTP Response-Body Limit**: The HTTP checker response body read limit is currently fixed at 1 MB via `io.LimitReader`; it cannot be tuned per monitor.
 * **Authentication & Authorization**: The REST API and frontend dashboard are unauthenticated (designed for protected internal networks).
 * **Single-Node Runtime**: The scheduler and worker pool operate in-process within a single binary. Distributed multi-node coordination and leader election are not yet implemented.
 * **No Distributed Tracing**: Observability covers structured logging and Prometheus metrics, but OpenTelemetry distributed tracing (spans, context propagation across external calls) is not implemented.
 * **No Server-Push Updates**: The frontend utilizes polling rather than WebSockets or Server-Sent Events (SSE) for state synchronization.
-* **Dashboard N+1 Status Requests**: The dashboard fetches the monitor list followed by concurrent status queries per monitor. While mitigated by React Query caching, future iterations could consolidate this into a single joined query.
 * **Containerization Deferred**: Docker packaging and Docker Compose manifests have not yet been created.
 * **CI/CD Deferred**: Automated GitHub Actions or pipeline definitions are not yet implemented.
 * **Cloud Infrastructure Deferred**: AWS deployment, Lambda adaptation, and Terraform definitions are not yet implemented.
@@ -555,9 +623,9 @@ The following architectural limitations represent intentional scope boundaries o
 ```mermaid
 timeline
     title Deployment Watchdog Engineering Roadmap
-    Completed : Phase 1 Core Engine : Phase 2 PostgreSQL Persistence : Phase 3 App Runtime : Phase 4 Multi-Monitor Scheduler : Phase 5 REST API : Phase 6 React 19 Dashboard : Phase 7 Observability & Telemetry : Production Hardening P1 Fixes
-    Next Stage : Performance & Load Testing (Establish baseline)
-    Deferred : Docker Containerization : CI/CD Automation : AWS & Terraform Infrastructure : Production Deployment Hardening
+    Completed : Phase 1 Core Engine : Phase 2 PostgreSQL Persistence : Phase 3 App Runtime : Phase 4 Multi-Monitor Scheduler : Phase 5 REST API : Phase 6 React 19 Dashboard : Phase 7 Observability & Telemetry : Production Hardening P1 Fixes : Phase 8 Performance & Load Testing
+    Next Stage : CI/CD Automation (GitHub Actions)
+    Deferred : Docker Containerization : AWS & Terraform Infrastructure : Production Deployment Hardening
 ```
 
 ### Completed
@@ -569,12 +637,12 @@ timeline
 * **Phase 6** — React management dashboard (React 19, Vite, Tailwind CSS v4, TanStack Query, UI polish)
 * **Phase 7** — Observability (structured `log/slog`, `/livez`, `/readyz`, Prometheus `/metrics`, subsystem instrumentation, cardinality controls, E2E verification)
 * **Production Hardening** — Audit and concrete P1 fixes (probe timeout enforcement, 1 MB request-body limit, regression test suites)
+* **Phase 8** — Performance & load testing (empirical baselines across 11 surfaces, worker scaling up to 50 workers, scheduler scaling up to 500 monitors, audited test suite in `test/benchmark/`)
 
 ### Next Engineering Stage
-* **Performance & Load Testing**: Establish empirical performance baselines for check dispatch throughput, worker pool saturation under high monitor counts, scheduler cycle latency, and database connection pool behavior under load. *(Note: Performance testing has not yet been performed; results will be established in this stage before further optimization).*
+* **CI/CD**: Automated testing, linting, race-detector validation, typechecking, and build pipelines via GitHub Actions.
 
 ### Deferred
 * **Docker / Containerization**: Multi-stage Dockerfile and Docker Compose definitions for reproducible local orchestration.
-* **CI/CD**: Automated testing, linting, race-detector validation, and container builds via GitHub Actions.
 * **AWS + Terraform**: Infrastructure-as-Code for production deployment, managed PostgreSQL, and alerting integrations.
 * **Production Deployment Hardening**: Multi-node coordination, authentication/authorization layers, and pagination.
