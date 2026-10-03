@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
+	"github.com/chavaliadi/watchdog/internal/alert"
 	"github.com/chavaliadi/watchdog/internal/checker"
 	"github.com/chavaliadi/watchdog/internal/monitor"
 	"github.com/chavaliadi/watchdog/internal/persistence"
@@ -27,6 +29,7 @@ type Orchestrator struct {
 	tcpRetrier  checker.Checker
 	repository  persistence.Repository
 	recorder    telemetry.Recorder
+	notifier    alert.Notifier
 }
 
 // NewOrchestrator creates a new Orchestrator with the supplied checkers, retry configuration,
@@ -56,6 +59,7 @@ func NewOrchestrator(
 		tcpRetrier:  retry.New(tcpChecker, retryCfg),
 		repository:  r,
 		recorder:    telemetry.NoopRecorder{},
+		notifier:    alert.NoopNotifier{},
 	}
 }
 
@@ -65,6 +69,15 @@ func (o *Orchestrator) WithRecorder(r telemetry.Recorder) *Orchestrator {
 		r = telemetry.NoopRecorder{}
 	}
 	o.recorder = r
+	return o
+}
+
+// WithNotifier configures the alert notifier on the Orchestrator.
+func (o *Orchestrator) WithNotifier(n alert.Notifier) *Orchestrator {
+	if n == nil {
+		n = alert.NoopNotifier{}
+	}
+	o.notifier = n
 	return o
 }
 
@@ -131,6 +144,22 @@ func (o *Orchestrator) RunCycle(
 		if err := o.repository.SaveCycle(ctx, m.ID, checkResult, transitionResult.NextState); err != nil {
 			rec.RecordCycleError("save_cycle")
 			return CycleResult{}, fmt.Errorf("save cycle for monitor %q: %w", m.ID, err)
+		}
+	}
+
+	// Alert on state transition into UNHEALTHY only.
+	// Notification failure is strictly non-fatal to the monitoring cycle.
+	if transitionResult.NextState == state.StateUnhealthy && transitionResult.Transitioned {
+		if o.notifier != nil {
+			event := alert.NewAlertEvent(m, transitionResult.CurrentState, transitionResult.NextState, checkResult)
+			if notifyErr := o.notifier.Notify(ctx, event); notifyErr != nil {
+				slog.Error("failed to dispatch unhealthy transition alert",
+					telemetry.AttrComponent, "alert",
+					telemetry.AttrMonitorID, m.ID,
+					telemetry.AttrError, notifyErr,
+				)
+				rec.RecordCycleError("alert")
+			}
 		}
 	}
 

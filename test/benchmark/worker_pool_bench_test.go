@@ -233,7 +233,7 @@ func TestWorkerPool_ScalingAndInvariants(t *testing.T) {
 		pool.Start(ctx)
 
 		latencies := make([]time.Duration, totalJobs)
-		var peakQueue int
+		var peakQueue int64
 
 		wallStart := time.Now()
 		var wg sync.WaitGroup
@@ -242,9 +242,12 @@ func TestWorkerPool_ScalingAndInvariants(t *testing.T) {
 			go func(idx int) {
 				defer wg.Done()
 				m := monitor.Monitor{ID: fmt.Sprintf("mon-scaled-%d", idx)}
-				q := pool.PendingCount()
-				if q > peakQueue {
-					peakQueue = q
+				q := int64(pool.PendingCount())
+				for {
+					curr := atomic.LoadInt64(&peakQueue)
+					if q <= curr || atomic.CompareAndSwapInt64(&peakQueue, curr, q) {
+						break
+					}
 				}
 
 				jStart := time.Now()

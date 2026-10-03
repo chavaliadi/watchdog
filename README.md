@@ -33,10 +33,14 @@ Modern software deployments frequently suffer from silent outages: portfolio sit
   * **Phase 7E**: End-to-end observability verification
   * **Production Hardening**: Production hardening audit and concrete P1 fixes (probe timeout enforcement, request-body limits, and regression suites)
   * **Phase 8**: Performance & load testing (empirical baselines established across all 11 performance surfaces, independently audited benchmark suite isolated under `test/benchmark/`)
-* **Next Engineering Stage**: **CI/CD** (Automating testing, race detection, linting, and build verification).
+  * **Phase 9 (Final Credibility Pass)**:
+    * **Alerting**: Webhook-based notification on monitor transitions into `UNHEALTHY` (non-fatal, bounded, strictly transition-based)
+    * **Dockerization**: Multi-stage, non-root `Dockerfile` and `docker-compose.yml` for unified Watchdog and PostgreSQL orchestration
+    * **CI/CD**: GitHub Actions workflow validating backend (Go tests + race detector) and frontend (Vitest + typecheck + build)
 * **Deferred / Not Yet Implemented**:
-  * Docker / containerization is **not** implemented.
   * AWS / Terraform production deployment is **not** implemented.
+  * Multi-node distributed scheduling is **not** implemented.
+  * Authentication & authorization are **not** implemented.
 
 ---
 
@@ -58,6 +62,9 @@ Modern software deployments frequently suffer from silent outages: portfolio sit
 * **Structured Logging**: Built-in Go standard library `log/slog` logging with configurable levels (`DEBUG`, `INFO`, `WARN`, `ERROR`), output formats (`text`, `json`), and context correlation (`req_id`, `cycle_id`, `monitor_id`).
 * **Health & Readiness Probes**: Shallow deterministic liveness probe (`GET /livez`) and deep dependency-aware readiness probe (`GET /readyz`) with graceful shutdown draining and bounded database ping timeouts.
 * **Prometheus Metrics**: Isolated application registry exposing runtime metrics (`GET /metrics`) covering checks, retries, cycle errors, HTTP API calls, DB operations, active monitors, and dynamic worker pool queue stats with strict bounded label cardinality.
+* **State-Transition Alerting**: Emits structured JSON webhook notifications strictly upon transitions into `UNHEALTHY` (`UNKNOWN -> UNHEALTHY`, `HEALTHY -> UNHEALTHY`). Webhook delivery failures are completely non-fatal, bounded by strict timeouts, and never impact core monitoring or state persistence.
+* **Docker Containerization**: Multi-stage, non-root Alpine Docker container and Docker Compose configuration orchestrating Watchdog alongside PostgreSQL with health checks.
+* **Continuous Integration (CI)**: GitHub Actions workflow executing unit/integration tests, race detector verification (`go test -race`), and frontend typechecking and production bundling on every push and pull request.
 * **Race & Concurrency Safe**: Verified with the Go race detector (`go test -race -count=1 ./...`).
 
 ---
@@ -524,6 +531,7 @@ export WATCHDOG_HTTP_PORT=":8080"
 export WATCHDOG_WORKER_CONCURRENCY=5
 export WATCHDOG_LOG_LEVEL="INFO"        # DEBUG, INFO, WARN, ERROR
 export WATCHDOG_LOG_FORMAT="text"       # text, json
+export WATCHDOG_ALERT_WEBHOOK_URL=""     # Optional generic webhook URL (e.g. Slack incoming webhook)
 
 # Start backend
 go run ./cmd/watchdog
@@ -541,6 +549,17 @@ npm run dev
 ```
 
 The dashboard opens on `http://localhost:5173`. Vite's development proxy automatically routes API calls to `http://localhost:8080`.
+
+### Alternative: Run with Docker Compose
+To launch both the PostgreSQL database and Watchdog in isolated containers with health checks:
+
+```bash
+# Start Watchdog and PostgreSQL
+docker compose up -d
+
+# Check service logs
+docker compose logs -f watchdog
+```
 
 ---
 
@@ -599,6 +618,115 @@ npm run build
 
 ---
 
+## Alerting & Webhooks
+
+Deployment Watchdog includes a generic webhook notifier that delivers immediate operational notifications when monitors fail.
+
+### State-Transition Semantics
+To prevent notification storms, alerts are emitted **strictly upon transitions into `UNHEALTHY`**:
+
+| Transition | Emits Outage Alert? | Rationale |
+|---|---|---|
+| `UNKNOWN -> HEALTHY` | No | Initial successful discovery |
+| `UNKNOWN -> UNHEALTHY` | **Yes** | Monitor immediately discovered in failure state |
+| `HEALTHY -> HEALTHY` | No | Normal continuous operation |
+| `HEALTHY -> UNHEALTHY` | **Yes** | Outage detected |
+| `UNHEALTHY -> UNHEALTHY` | **No** | Steady-state failure; no alert spam on repeated failed cycles |
+| `UNHEALTHY -> HEALTHY` | No | Recovery (outage resolved) |
+| `HEALTHY -> UNKNOWN` | No | No outage transition |
+
+Alerts are decoupled from retry attempts: retries are exhausted first, and only the resulting state transition triggers an alert.
+
+### Webhook Configuration
+Alerting is configured via the environment variable:
+```bash
+export WATCHDOG_ALERT_WEBHOOK_URL="https://hooks.slack.com/services/T00/B00/X123"
+```
+* **Optional & Non-Breaking**: If `WATCHDOG_ALERT_WEBHOOK_URL` is empty or unset, alerting is disabled and monitoring continues normally.
+* **Failure Isolation**: Alert delivery is completely non-fatal. If the webhook endpoint returns a non-2xx status, network error, or times out, the failure is logged and recorded in metrics (`watchdog_scheduler_cycle_errors_total{stage="alert"}`), but the check result and state transition remain saved in PostgreSQL. The scheduler never crashes or blocks.
+* **Bounded Timeout**: Webhook requests enforce a strict 5-second timeout and bounded response-body drain to prevent worker goroutine stalls.
+
+### Payload Schema
+The webhook delivers a stable JSON payload:
+```json
+{
+  "event": "monitor_unhealthy",
+  "monitor": {
+    "id": "0194eb12-789a-7b3e-8fa9-994dc15f4012",
+    "name": "Production API",
+    "kind": "http",
+    "target": "https://api.example.com/health"
+  },
+  "transition": {
+    "from": "HEALTHY",
+    "to": "UNHEALTHY"
+  },
+  "check": {
+    "ok": false,
+    "status_code": 503,
+    "error_class": "status",
+    "error_detail": "upstream service unavailable",
+    "attempt_count": 3,
+    "latency_ms": 142
+  },
+  "timestamp": "2026-10-03T19:30:00Z"
+}
+```
+
+### Security & Sanitization
+* **Credential Stripping**: Userinfo credentials (`user:password@host`) embedded within target URLs are automatically stripped prior to webhook dispatch.
+* **Bounded Error Details**: Error descriptions are truncated to 256 characters and stripped of control characters.
+* **Credential Concealment**: Webhook URLs and authorization tokens are never logged or leaked into application error strings.
+
+---
+
+## Docker & Container Deployment
+
+Deployment Watchdog includes a production-oriented containerization setup for reproducible local execution.
+
+### Multi-Stage Dockerfile
+The `Dockerfile` employs a multi-stage Go build pattern:
+* **Build Stage**: Uses `golang:1.26-alpine` to compile a statically-linked, CGO-disabled binary with stripped symbol tables (`-ldflags="-s -w"`).
+* **Runtime Stage**: Uses minimal `alpine:3.21` with CA certificates and timezone data.
+* **Non-Root User**: Runs under dedicated unprivileged system user `watchdog:watchdog` (UID/GID `10001`).
+* **Minimal Attack Surface**: The final image contains only the compiled binary, certificates, and runtime OS files.
+
+### Docker Compose
+A unified `docker-compose.yml` orchestrates Watchdog alongside a PostgreSQL 16 database:
+* **Watchdog Service**: Runs the application on port `8080` with runtime environment configuration.
+* **PostgreSQL Service**: Runs PostgreSQL with a persistent named volume (`postgres_data`) and an automated `pg_isready` healthcheck.
+* **Dependency Ordering**: Watchdog depends on PostgreSQL with `condition: service_healthy`, ensuring the database is accepting connections before the engine boots.
+
+```bash
+# Launch Watchdog and PostgreSQL
+docker compose up -d
+
+# Check status
+docker compose ps
+
+# View application logs
+docker compose logs -f watchdog
+```
+
+---
+
+## Continuous Integration (GitHub Actions)
+
+Continuous integration is automated via GitHub Actions in `.github/workflows/ci.yml`. Every `push` and `pull_request` to `main` executes two parallel verification jobs:
+
+* **Backend Job (Go)**:
+  * Automatically sets up Go matching the version in `go.mod`.
+  * Runs all unit, integration, and alerting test suites (`go test -v ./cmd/... ./internal/...`).
+  * Runs the Go race detector across all packages (`go test -race ./cmd/... ./internal/...`) to guarantee concurrency safety.
+* **Frontend Job (React / Vite)**:
+  * Sets up Node.js 20 with dependency caching.
+  * Runs strict dependency installation (`npm ci`).
+  * Executes the Vitest unit/component suite (`npm test`).
+  * Verifies static type safety with the TypeScript compiler (`npm run typecheck`).
+  * Validates production asset bundling with Vite (`npm run build`).
+
+---
+
 ## Current Limitations
 
 The following architectural limitations represent intentional scope boundaries, stress-workload observations, or areas for future optimization:
@@ -612,8 +740,6 @@ The following architectural limitations represent intentional scope boundaries, 
 * **Single-Node Runtime**: The scheduler and worker pool operate in-process within a single binary. Distributed multi-node coordination and leader election are not yet implemented.
 * **No Distributed Tracing**: Observability covers structured logging and Prometheus metrics, but OpenTelemetry distributed tracing (spans, context propagation across external calls) is not implemented.
 * **No Server-Push Updates**: The frontend utilizes polling rather than WebSockets or Server-Sent Events (SSE) for state synchronization.
-* **Containerization Deferred**: Docker packaging and Docker Compose manifests have not yet been created.
-* **CI/CD Deferred**: Automated GitHub Actions or pipeline definitions are not yet implemented.
 * **Cloud Infrastructure Deferred**: AWS deployment, Lambda adaptation, and Terraform definitions are not yet implemented.
 
 ---
@@ -623,9 +749,8 @@ The following architectural limitations represent intentional scope boundaries, 
 ```mermaid
 timeline
     title Deployment Watchdog Engineering Roadmap
-    Completed : Phase 1 Core Engine : Phase 2 PostgreSQL Persistence : Phase 3 App Runtime : Phase 4 Multi-Monitor Scheduler : Phase 5 REST API : Phase 6 React 19 Dashboard : Phase 7 Observability & Telemetry : Production Hardening P1 Fixes : Phase 8 Performance & Load Testing
-    Next Stage : CI/CD Automation (GitHub Actions)
-    Deferred : Docker Containerization : AWS & Terraform Infrastructure : Production Deployment Hardening
+    Completed : Phase 1 Core Engine : Phase 2 PostgreSQL Persistence : Phase 3 App Runtime : Phase 4 Multi-Monitor Scheduler : Phase 5 REST API : Phase 6 React 19 Dashboard : Phase 7 Observability & Telemetry : Production Hardening P1 Fixes : Phase 8 Performance & Load Testing : Phase 9 Alerting, Docker & CI
+    Deferred : AWS & Terraform Infrastructure : Distributed Multi-Node Scheduling : Authentication & Authorization
 ```
 
 ### Completed
@@ -638,11 +763,10 @@ timeline
 * **Phase 7** — Observability (structured `log/slog`, `/livez`, `/readyz`, Prometheus `/metrics`, subsystem instrumentation, cardinality controls, E2E verification)
 * **Production Hardening** — Audit and concrete P1 fixes (probe timeout enforcement, 1 MB request-body limit, regression test suites)
 * **Phase 8** — Performance & load testing (empirical baselines across 11 surfaces, worker scaling up to 50 workers, scheduler scaling up to 500 monitors, audited test suite in `test/benchmark/`)
-
-### Next Engineering Stage
-* **CI/CD**: Automated testing, linting, race-detector validation, typechecking, and build pipelines via GitHub Actions.
+* **Phase 9 (Final Credibility Pass)** — Alerting (generic webhook on transitions into UNHEALTHY, non-fatal delivery, payload sanitization), Dockerization (multi-stage non-root Dockerfile, Docker Compose with PostgreSQL health checks), and CI/CD (GitHub Actions workflow for backend tests, race detector, and frontend validation)
 
 ### Deferred
-* **Docker / Containerization**: Multi-stage Dockerfile and Docker Compose definitions for reproducible local orchestration.
 * **AWS + Terraform**: Infrastructure-as-Code for production deployment, managed PostgreSQL, and alerting integrations.
-* **Production Deployment Hardening**: Multi-node coordination, authentication/authorization layers, and pagination.
+* **Distributed Multi-Node Scheduling**: Cluster coordination, leader election, and distributed work dispatch.
+* **Authentication & Authorization**: API tokens, JWT/OAuth2 user sessions, and role-based access control.
+

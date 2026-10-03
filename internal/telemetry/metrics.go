@@ -354,6 +354,8 @@ func normalizeStage(stage string) string {
 		return "run_cycle"
 	case "save_cycle":
 		return "save_cycle"
+	case "alert":
+		return "alert"
 	default:
 		return "other"
 	}

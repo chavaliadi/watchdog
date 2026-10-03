@@ -16,6 +16,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/chavaliadi/watchdog/internal/alert"
 	"github.com/chavaliadi/watchdog/internal/api"
 	"github.com/chavaliadi/watchdog/internal/persistence"
 	"github.com/chavaliadi/watchdog/internal/persistence/postgres"
@@ -33,6 +34,7 @@ type Config struct {
 	HTTPPort          string
 	LogLevel          string
 	LogFormat         string
+	AlertWebhookURL   string
 }
 
 const (
@@ -67,6 +69,7 @@ func loadConfig() (Config, error) {
 		HTTPPort:          httpPort,
 		LogLevel:          os.Getenv("WATCHDOG_LOG_LEVEL"),
 		LogFormat:         os.Getenv("WATCHDOG_LOG_FORMAT"),
+		AlertWebhookURL:   os.Getenv("WATCHDOG_ALERT_WEBHOOK_URL"),
 	}, nil
 }
 
@@ -112,8 +115,19 @@ func run(ctx context.Context) error {
 
 	metrics := telemetry.NewMetrics()
 
+	notifier := alert.NewWebhookNotifier(alert.WebhookConfig{
+		WebhookURL: cfg.AlertWebhookURL,
+	})
+	if cfg.AlertWebhookURL != "" {
+		slog.Info("alerting configured via webhook", telemetry.AttrComponent, "main")
+	} else {
+		slog.Info("alerting disabled (WATCHDOG_ALERT_WEBHOOK_URL unset)", telemetry.AttrComponent, "main")
+	}
+
 	var repo persistence.Repository = postgres.New(db, postgres.WithRecorder(metrics))
-	orch := scheduler.NewOrchestrator(nil, nil, retry.Config{Recorder: metrics}, repo).WithRecorder(metrics)
+	orch := scheduler.NewOrchestrator(nil, nil, retry.Config{Recorder: metrics}, repo).
+		WithRecorder(metrics).
+		WithNotifier(notifier)
 
 	pool, err := worker.NewPool(worker.Config{
 		MaxConcurrency: cfg.WorkerConcurrency,

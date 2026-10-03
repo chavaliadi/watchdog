@@ -195,6 +195,34 @@ func TestLoadConfig_LoggingConfig(t *testing.T) {
 	}
 }
 
+func TestLoadConfig_AlertWebhookURL(t *testing.T) {
+	t.Run("empty when unset", func(t *testing.T) {
+		t.Setenv("WATCHDOG_DATABASE_URL", "postgres://user:pass@localhost:5432/watchdog_db")
+		t.Setenv("WATCHDOG_ALERT_WEBHOOK_URL", "")
+
+		cfg, err := loadConfig()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.AlertWebhookURL != "" {
+			t.Errorf("expected empty AlertWebhookURL, got %q", cfg.AlertWebhookURL)
+		}
+	})
+
+	t.Run("populated when set", func(t *testing.T) {
+		t.Setenv("WATCHDOG_DATABASE_URL", "postgres://user:pass@localhost:5432/watchdog_db")
+		t.Setenv("WATCHDOG_ALERT_WEBHOOK_URL", "https://hooks.slack.com/services/T00/B00/X123")
+
+		cfg, err := loadConfig()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.AlertWebhookURL != "https://hooks.slack.com/services/T00/B00/X123" {
+			t.Errorf("expected AlertWebhookURL to be populated, got %q", cfg.AlertWebhookURL)
+		}
+	})
+}
+
 func TestRun_DatabaseErrorsPropagate(t *testing.T) {
 	t.Setenv("WATCHDOG_DATABASE_URL", "postgres://user:pass@127.0.0.1:1/nonexistent?sslmode=disable&connect_timeout=1")
 

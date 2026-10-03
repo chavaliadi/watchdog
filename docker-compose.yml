@@ -1,0 +1,39 @@
+services:
+  watchdog:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${WATCHDOG_HOST_PORT:-8080}:8080"
+    environment:
+      - WATCHDOG_DATABASE_URL=postgres://${POSTGRES_USER:-watchdog}:${POSTGRES_PASSWORD:-watchdog_secret}@postgres:5432/${POSTGRES_DB:-watchdog}?sslmode=disable
+      - WATCHDOG_WORKER_CONCURRENCY=${WATCHDOG_WORKER_CONCURRENCY:-5}
+      - WATCHDOG_HTTP_PORT=:8080
+      - WATCHDOG_LOG_LEVEL=${WATCHDOG_LOG_LEVEL:-INFO}
+      - WATCHDOG_LOG_FORMAT=${WATCHDOG_LOG_FORMAT:-text}
+      - WATCHDOG_ALERT_WEBHOOK_URL=${WATCHDOG_ALERT_WEBHOOK_URL:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-watchdog}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-watchdog_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-watchdog}
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-watchdog} -d ${POSTGRES_DB:-watchdog}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
